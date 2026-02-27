@@ -1,0 +1,6 @@
+from abc import ABC
+
+class BaseModel(ABC):
+    def forward_flops(self) -> int: ...
+
+    def forward(self): ...

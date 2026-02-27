@@ -1,0 +1,27 @@
+# PyTorch
+torch>=2.1.0
+torchvision>=0.16.0
+
+# PyTorch Lightning
+pytorch-lightning>=2.1.0
+
+# HuggingFace Transformers & Tokenizers
+transformers>=4.35.0
+tokenizers>=0.14.0
+evaluate
+nltk
+
+# Datasets
+datasets>=2.12.0
+
+# Logging
+tensorboard>=2.15.0
+
+# Utilities
+tqdm>=4.66.0
+pandas>=2.1.0
+pyyaml>=6.0.0
+numpy>=1.26.0
+
+# Optional for nice defaultdict / more utils
+typing_extensions>=4.7.0

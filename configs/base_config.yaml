@@ -1,0 +1,39 @@
+experiment:
+  name: mapper_llm_debug
+  seed: 42
+  output_dir: runs/
+
+data:
+  batch_size: 1
+  num_workers: 4
+
+models:
+  embedder:
+    name: bert-base-uncased
+    trainable: false
+    max_length: 512
+
+  mapper:
+    class: BaseMapper
+    params:
+      in_dim: 768
+      out_dim: 768
+    trainable: true
+
+  llm:
+    name: gpt2
+    trainable: false
+    max_length: 256
+
+training:
+  lr: 0.0001
+  max_epochs: 3
+  gradient_clip_val: 1.0
+  precision: 16
+
+logging:
+  tensorboard: true
+  log_every_n_steps: 10
+
+compute:
+  target_metric: null   # или число, если считаем compute-to-quality
