@@ -6,6 +6,7 @@ experiment:
 data:
   batch_size: 1
   num_workers: 4
+  n_samples: 500   # total examples drawn from dataset["train"]; 90% → train, 10% → val (stratified by task)
 
 models:
   embedder:

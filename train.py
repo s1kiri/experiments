@@ -11,6 +11,7 @@ from src.models.mapper import BaseMapper
 from src.models.llm import HFLLM
 from src.models.lightning_module import MapperLLMModule
 from src.data.data_module import TextDataModule
+from src.data.schema import SPECIAL_TOKENS
 
 
 def load_config(path: str):
@@ -29,6 +30,7 @@ def main(config_path: str, train_ds, val_ds):
     emb_tok = AutoTokenizer.from_pretrained(cfg["models"]["embedder"]["name"])
     llm_tok = AutoTokenizer.from_pretrained(cfg["models"]["llm"]["name"])
     llm_tok.pad_token = llm_tok.eos_token
+    llm_tok.add_special_tokens({"additional_special_tokens": SPECIAL_TOKENS})
 
     # --------------------
     # models
@@ -50,6 +52,9 @@ def main(config_path: str, train_ds, val_ds):
         trainable=llm_cfg["trainable"],
         max_length=llm_cfg["max_length"],
     )
+    # Resize token embeddings to cover the newly added special tokens.
+    # New rows are frozen along with the rest of the LLM when trainable=False.
+    llm.model.resize_token_embeddings(len(llm_tok))
 
     # --------------------
     # lightning module
@@ -107,8 +112,24 @@ def main(config_path: str, train_ds, val_ds):
 
 
 if __name__ == "__main__":
-    dataset = load_from_disk("data/narrativeqa_dataset")
+    # Expected schema: id, split, task, source_text, question, answer
+    # See src/data/schema.py
+    config_path = "configs/base_config.yaml"
+    cfg = load_config(config_path)
 
-    train_ds = dataset["train"].select(range(500))
-    val_ds = dataset["validation"].select(range(50))
-    main("configs/base_config.yaml", train_ds, val_ds)
+    dataset  = load_from_disk("data/unified_dataset")
+    n_samples = cfg["data"]["n_samples"]
+    seed      = cfg["experiment"]["seed"]
+
+    # Shuffle → take n_samples → stratified 90/10 split by task
+    sampled = (
+        dataset["train"]
+        .shuffle(seed=seed)
+        .select(range(min(n_samples, len(dataset["train"]))))
+    )
+    # stratify_by_column="task"
+    splits   = sampled.train_test_split(test_size=0.1, seed=seed)
+    train_ds = splits["train"]
+    val_ds   = splits["test"]
+
+    main(config_path, train_ds, val_ds)

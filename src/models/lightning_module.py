@@ -31,12 +31,14 @@ class MapperLLMModule(pl.LightningModule):
         self.rouge = evaluate.load("rouge")
         self.bleu = evaluate.load("bleu")
 
-        # stores (pred, target, source_text) triples per task across validation steps
+        # stores (pred, answer, source_text, question) quads per task across validation steps
         self.val_storage = defaultdict(list)
 
         self.target_metric = target_metric
         self.reached_target = False
         self.compute_to_quality = None
+
+        self.flops_per_step = 0  # set in on_fit_start
 
         self.save_hyperparameters(ignore=["embedder", "mapper", "llm", "llm_tokenizer"])
 
@@ -101,6 +103,12 @@ class MapperLLMModule(pl.LightningModule):
         loss = outputs.loss
 
         self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+        self.log(
+            "train/cumulative_flops",
+            float(self.flops_per_step * (self.global_step + 1)),
+            on_step=True,
+            prog_bar=False,
+        )
         return loss
 
     def on_before_optimizer_step(self, optimizer):
@@ -131,35 +139,49 @@ class MapperLLMModule(pl.LightningModule):
         source_input_ids = batch["source_input_ids"]
         source_attention_mask = batch["source_attention_mask"]
 
+        answers   = batch.get("answer",      [""] * source_input_ids.size(0))
+        tasks     = batch.get("task",        ["default"] * source_input_ids.size(0))
+        src_texts = batch.get("source_text", [""] * source_input_ids.size(0))
+        questions = batch.get("question",    [""] * source_input_ids.size(0))
+
+        get_embeds = self.llm.model.get_input_embeddings()
+        preds = []
+
         with torch.no_grad():
             z = self.embedder(
                 input_ids=source_input_ids,
                 attention_mask=source_attention_mask
             )
+            h = self.mapper(z)  # [B, S, D_llm]
 
-            h = self.mapper(z)
+            for i, task in enumerate(tasks):
+                hi = h[i:i+1]  # [1, S, D_llm]
 
-            generated = self.llm.generate(
-                inputs_embeds=h,
-                max_new_tokens=64,
-                pad_token_id=self.llm_tokenizer.pad_token_id,
-            )
+                if task == "qa":
+                    # Provide the question as a text prefix so the model can answer it.
+                    # This matches the training layout:
+                    #   [h] [<QA> question <ANSWER>] → generate answer
+                    q_text = f"<QA> {questions[i]} <ANSWER>"
+                    q_ids = self.llm_tokenizer(
+                        q_text, add_special_tokens=False, return_tensors="pt"
+                    ).input_ids.to(hi.device)
+                    q_embeds = get_embeds(q_ids)          # [1, L_q, D_llm]
+                    gen_input = torch.cat([hi, q_embeds], dim=1)
+                else:
+                    # Narrative: generate the reconstruction from h alone.
+                    gen_input = hi
 
-        preds = self.llm_tokenizer.batch_decode(
-            generated,
-            skip_special_tokens=True
-        )
+                out = self.llm.generate(
+                    inputs_embeds=gen_input,
+                    max_new_tokens=64,
+                    pad_token_id=self.llm_tokenizer.pad_token_id,
+                )
+                preds.append(
+                    self.llm_tokenizer.decode(out[0], skip_special_tokens=True)
+                )
 
-        targets = self.llm_tokenizer.batch_decode(
-            batch["target_input_ids"],
-            skip_special_tokens=True
-        )
-
-        tasks = batch.get("task", ["default"] * len(preds))
-        source_texts = batch.get("source_text", [""] * len(preds))
-
-        for p, t, src, task in zip(preds, targets, source_texts, tasks):
-            self.val_storage[task].append((p, t, src))
+        for p, ans, src, q, task in zip(preds, answers, src_texts, questions, tasks):
+            self.val_storage[task].append((p, ans, src, q))
 
         return val_loss
 
@@ -193,29 +215,31 @@ class MapperLLMModule(pl.LightningModule):
             2 * trainable_flops
         )
 
+        # File "/Users/kirill/My Folder/study/thesis/experiments/venv/lib/python3.9/site-packages/pytorch_lightning/trainer/connectors/logger_connector/fx_validator.py", line 161, in check_logging
+        # raise MisconfigurationException(
+        # lightning_fabric.utilities.exceptions.MisconfigurationException: You can't `self.log()` inside `on_fit_start`. HINT: You can still log directly to the logger by using `self.logger.experiment`.
+        # self.log("train/flops_per_step", float(self.flops_per_step), on_step=False, on_epoch=False)
+
     def on_validation_epoch_end(self):
-        for task, triplets in self.val_storage.items():
-            preds = [p for p, _, _ in triplets]
-            refs  = [t for _, t, _ in triplets]
-            srcs  = [s for _, _, s in triplets]
+        for task, quads in self.val_storage.items():
+            preds = [p   for p, _, _, _ in quads]
+            refs  = [ans for _, ans, _, _ in quads]
+            srcs  = [src for _, _, src, _ in quads]
+            qs    = [q   for _, _, _, q in quads]
 
-            rouge_scores = self.rouge.compute(
-                predictions=preds,
-                references=refs
-            )
+            rouge_scores = self.rouge.compute(predictions=preds, references=refs)
+            bleu_score   = self.bleu.compute(predictions=preds, references=[[r] for r in refs])
+            token_acc    = self.compute_token_accuracy(preds, refs)
 
-            bleu_score = self.bleu.compute(
-                predictions=preds,
-                references=[[r] for r in refs]
-            )
+            prefix_len, em = self.compute_prefix_metrics(preds, refs)
 
-            token_acc = self.compute_token_accuracy(preds, refs)
+            self.log(f"val/{task}/rougeL",          rouge_scores["rougeL"])
+            self.log(f"val/{task}/bleu",             bleu_score["bleu"])
+            self.log(f"val/{task}/token_acc",        token_acc)
+            self.log(f"val/{task}/prefix_match_len", prefix_len)
+            self.log(f"val/{task}/em",               em)
 
-            self.log(f"val/{task}/rougeL",    rouge_scores["rougeL"])
-            self.log(f"val/{task}/bleu",       bleu_score["bleu"])
-            self.log(f"val/{task}/token_acc",  token_acc)
-
-            self._log_val_table(task, preds, refs, srcs)
+            self._log_val_table(task, preds, refs, srcs, qs)
 
         self.val_storage.clear()
 
@@ -235,7 +259,35 @@ class MapperLLMModule(pl.LightningModule):
             total += min_len
         return correct / total if total > 0 else 0.0
 
-    def _log_val_table(self, task, preds, refs, srcs):
+    def compute_prefix_metrics(self, preds, refs):
+        """
+        prefix_match_len: average number of whitespace-tokens matched consecutively
+                          from position 0 until the first mismatch.
+
+        em (Exact Match prefix ratio): prefix_match_len / len(ref_tokens).
+            Example: if the first 256 of 512 reference tokens are perfectly restored,
+            em = 256 / 512 = 0.5.
+
+        Both are averaged over the batch.
+        """
+        prefix_lens = []
+        em_scores   = []
+        for p, r in zip(preds, refs):
+            p_toks = p.split()
+            r_toks = r.split()
+            match_len = 0
+            for pt, rt in zip(p_toks, r_toks):
+                if pt == rt:
+                    match_len += 1
+                else:
+                    break
+            prefix_lens.append(match_len)
+            em_scores.append(match_len / len(r_toks) if r_toks else 0.0)
+        avg_prefix = sum(prefix_lens) / len(prefix_lens) if prefix_lens else 0.0
+        avg_em     = sum(em_scores)   / len(em_scores)   if em_scores   else 0.0
+        return avg_prefix, avg_em
+
+    def _log_val_table(self, task, preds, refs, srcs, questions):
         """Write a sample table to TensorBoard as markdown text."""
         logger = self.logger
         if isinstance(logger, list):
@@ -246,15 +298,26 @@ class MapperLLMModule(pl.LightningModule):
         if not hasattr(exp, "add_text"):
             return
 
-        lines = [f"## {task} — epoch {self.current_epoch}\n"]
-        lines.append("| # | Source (truncated) | Prediction | Target |")
-        lines.append("|---|---|---|---|")
+        show_question = task == "qa"
+        if show_question:
+            lines = [f"## {task} — epoch {self.current_epoch}\n"]
+            lines.append("| # | Source (truncated) | Question | Prediction | Answer |")
+            lines.append("|---|---|---|---|---|")
+        else:
+            lines = [f"## {task} — epoch {self.current_epoch}\n"]
+            lines.append("| # | Source (truncated) | Prediction | Target |")
+            lines.append("|---|---|---|---|")
 
-        for i, (p, r, s) in enumerate(zip(preds[:_VAL_LOG_EXAMPLES], refs[:_VAL_LOG_EXAMPLES], srcs[:_VAL_LOG_EXAMPLES])):
-            # truncate long source; escape markdown pipe chars
-            s_disp = s[:200].replace("|", "\\|").replace("\n", " ")
-            p_disp = p.replace("|", "\\|").replace("\n", " ")
-            r_disp = r.replace("|", "\\|").replace("\n", " ")
-            lines.append(f"| {i + 1} | {s_disp} | {p_disp} | {r_disp} |")
+        n = _VAL_LOG_EXAMPLES
+        for i, (p, r, s, q) in enumerate(zip(preds[:n], refs[:n], srcs[:n], questions[:n])):
+            def _esc(t): return t[:300].replace("|", "\\|").replace("\n", " ")
+            s_disp = _esc(s[:200])
+            p_disp = _esc(p)
+            r_disp = _esc(r)
+            if show_question:
+                q_disp = _esc(q)
+                lines.append(f"| {i + 1} | {s_disp} | {q_disp} | {p_disp} | {r_disp} |")
+            else:
+                lines.append(f"| {i + 1} | {s_disp} | {p_disp} | {r_disp} |")
 
         exp.add_text(f"val/{task}_samples", "\n".join(lines), self.global_step)
