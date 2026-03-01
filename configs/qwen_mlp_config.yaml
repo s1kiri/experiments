@@ -1,0 +1,48 @@
+experiment:
+  name: pooled_qwen_ctx1    # rename per run: ctx1 → ctx4 → ctx8 → ctx16 → ctx32
+  seed: 42
+  output_dir: runs/
+
+data:
+  batch_size: 1            # safe on H100; try 32 after verifying no OOM
+  num_workers: 4
+  n_samples: 100            # increase for real runs
+
+models:
+  cache_dir: model_cache    # local dir for downloaded weights; null → use HF default cache
+
+  embedder:
+    name: Qwen/Qwen3-Embedding-0.6B
+    trainable: true
+    max_length: 512
+
+  mapper:
+    class: PooledMLPMapper
+    params:
+      in_dim: 1024
+      out_dim: 1024
+      n_ctx_tokens: 1       # experimental axis: 1 → 4 → 8 → 16 → 32
+    trainable: true
+
+  llm:
+    name: Qwen/Qwen3-0.6B
+    trainable: false
+    max_length: 256
+
+training:
+  lr: 0.0001
+  warmup_steps: 200         # linear warmup then cosine decay
+  max_epochs: 10
+  gradient_clip_val: 1.0
+  precision: "bf16"   # H100 native; do NOT use 16 (fp16 GradScaler breaks on bf16 weights)
+
+logging:
+  tensorboard: true
+  log_every_n_steps: 10
+
+compute:
+  device: cpu            # training device: "cpu" | "cuda:0" | "cuda:1" | ...
+  target_metric: null
+
+debug: true             # true → verbose prints in forward/collate (shapes, stats, decoded targets)
+val_generate: true       # false → skip free generation in validation (faster CPU iteration)

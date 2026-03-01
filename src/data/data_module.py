@@ -27,6 +27,7 @@ class TextDataset(Dataset):
             "question":              row.get("question", ""),
             "answer":                row.get("answer", ""),
             "tokenized_source_text": row.get("tokenized_source_text"),
+            "am_source_text":        row.get("am_source_text"),   # precomputed mask
             "tokenized_target_text": row.get("tokenized_target_text"),
             "n_label_mask":          row.get("n_label_mask", 0),
             "task":                  row.get("task"),
@@ -34,10 +35,14 @@ class TextDataset(Dataset):
         }
 
 
-def text_collate_fn(batch, src_pad_id=0, tgt_pad_id=0):
+def text_collate_fn(batch, src_pad_id=0, tgt_pad_id=0, debug=False):
     """
     Pads source and target sequences separately.
     Prepares labels for autoregressive LLM training.
+
+    Source attention mask is taken from the precomputed am_source_text (stored
+    at tokenization time) and padded with 0, so it never depends on the pad token
+    ID value — avoiding the bug where pad_id=0 would mask real token ID 0.
 
     For QA, the question-prefix tokens are masked with -100 so the model
     is trained only on the answer tokens.
@@ -49,7 +54,15 @@ def text_collate_fn(batch, src_pad_id=0, tgt_pad_id=0):
         for sample in batch
     ]
     source_input_ids = pad_sequence(source_ids, batch_first=True, padding_value=src_pad_id)
-    source_attention_mask = (source_input_ids != src_pad_id).long()
+
+    # Use the precomputed tokenizer attention mask; fall back to ID-comparison only
+    # if the dataset was produced without am_source_text.
+    am_lists = [sample.get("am_source_text") for sample in batch]
+    if am_lists[0] is not None:
+        am_tensors = [torch.tensor(m, dtype=torch.long) for m in am_lists]
+        source_attention_mask = pad_sequence(am_tensors, batch_first=True, padding_value=0)
+    else:
+        source_attention_mask = (source_input_ids != src_pad_id).long()
 
     target_ids = [
         torch.tensor(sample["tokenized_target_text"], dtype=torch.long)
@@ -69,6 +82,17 @@ def text_collate_fn(batch, src_pad_id=0, tgt_pad_id=0):
 
     tasks = [sample.get("task", "default") for sample in batch]
     ids   = [sample.get("id", i) for i, sample in enumerate(batch)]
+
+    if debug:
+        s = batch[0]
+        print(
+            f"[DEBUG collate] task={s.get('task')} "
+            f"src_real={source_attention_mask[0].sum().item()}/{source_input_ids.size(1)} "
+            f"tgt_len={target_attention_mask[0].sum().item()} "
+            f"n_label_mask={s.get('n_label_mask', 0)} "
+            f"active_labels={(labels[0] != -100).sum().item()}",
+            flush=True,
+        )
 
     return {
         # embedder inputs
@@ -109,6 +133,7 @@ class TextDataModule(pl.LightningDataModule):
         batch_size: int = 4,
         num_workers: int = 4,
         pin_memory: bool = True,
+        debug: bool = False,
     ):
         super().__init__()
         self.emb_tok = emb_tok
@@ -116,8 +141,16 @@ class TextDataModule(pl.LightningDataModule):
         self.emb_max_length = emb_max_length
         self.llm_max_length = llm_max_length
         self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.pin_memory = pin_memory
+        self.debug = debug
+
+        # On CPU: multiple workers add IPC overhead that exceeds any speedup,
+        # and pin_memory is a GPU-only optimization.
+        if not torch.cuda.is_available():
+            self.num_workers = 0
+            self.pin_memory  = False
+        else:
+            self.num_workers = num_workers
+            self.pin_memory  = pin_memory
 
         self.train_dataset = TextDataset(self.prepare_dataset(train_dataset))
         self.val_dataset   = TextDataset(self.prepare_dataset(val_dataset))
@@ -127,6 +160,7 @@ class TextDataModule(pl.LightningDataModule):
             text_collate_fn,
             src_pad_id=self.emb_tok.pad_token_id or 0,
             tgt_pad_id=self.llm_tok.pad_token_id or 0,
+            debug=self.debug,
         )
 
     def train_dataloader(self) -> DataLoader:
@@ -164,11 +198,16 @@ class TextDataModule(pl.LightningDataModule):
             add_special_tokens=True,
         )
 
+        # Prepend an empty thinking block so Qwen3 skips its thinking mode and
+        # outputs the task response directly.  Without this, Qwen3 (base and
+        # instruct) generates <think>/<tool_call> tokens before any real output.
+        _bypass = "<think>\n</think>\n\n"
+
         if task == "narrative":
-            prefix_text = "<REPRODUCE>"
+            prefix_text = f"{_bypass}<REPRODUCE>"
             answer_text = example["answer"]
         elif task == "qa":
-            prefix_text = f"<QA> {example['question']} <ANSWER>"
+            prefix_text = f"{_bypass}<QA> {example['question']} <ANSWER>"
             answer_text = example["answer"]
         else:
             raise ValueError(f"Unknown task: {task!r}. Expected one of {TASKS}.")
@@ -181,7 +220,7 @@ class TextDataModule(pl.LightningDataModule):
         answer_ids = self.llm_tok(
             answer_text,
             truncation=True,
-            max_length=self.llm_max_length - len(prefix_ids),
+            max_length=max(1, self.llm_max_length - len(prefix_ids)),
             add_special_tokens=False,
         ).input_ids
 

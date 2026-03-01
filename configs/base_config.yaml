@@ -1,14 +1,16 @@
 experiment:
-  name: mapper_llm_debug
+  name: mlp_run
   seed: 42
   output_dir: runs/
 
 data:
   batch_size: 1
   num_workers: 4
-  n_samples: 500   # total examples drawn from dataset["train"]; 90% → train, 10% → val (stratified by task)
+  n_samples: 1000   # total examples drawn from dataset["train"]; 90% → train, 10% → val (stratified by task)
 
 models:
+  cache_dir: model_cache   # local dir for downloaded weights; null → use HF default cache
+
   embedder:
     name: bert-base-uncased
     trainable: false
@@ -37,4 +39,5 @@ logging:
   log_every_n_steps: 10
 
 compute:
+  device: cpu            # training device: "cpu" | "cuda:0" | "cuda:1" | ...
   target_metric: null   # или число, если считаем compute-to-quality

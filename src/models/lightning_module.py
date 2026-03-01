@@ -1,10 +1,12 @@
 import torch
-import evaluate
 from collections import defaultdict
 import pytorch_lightning as pl
+from transformers import get_cosine_schedule_with_warmup
+
 from src.models.embedder import HFEmbedder
 from src.models.llm import HFLLM
 from src.models.mapper import BaseMapper
+from src.metrics import bleu4, rouge_l
 
 # Number of validation samples per task to display in TensorBoard
 _VAL_LOG_EXAMPLES = 8
@@ -18,7 +20,10 @@ class MapperLLMModule(pl.LightningModule):
         llm: HFLLM,
         llm_tokenizer,
         lr: float = 1e-4,
+        warmup_steps: int = 0,
         target_metric: None = None,
+        val_generate: bool = True,
+        debug: bool = False,
     ):
         super().__init__()
 
@@ -27,9 +32,9 @@ class MapperLLMModule(pl.LightningModule):
         self.llm = llm
         self.llm_tokenizer = llm_tokenizer
         self.lr = lr
-
-        self.rouge = evaluate.load("rouge")
-        self.bleu = evaluate.load("bleu")
+        self.warmup_steps = warmup_steps
+        self.val_generate = val_generate
+        self.debug = debug
 
         # stores (pred, answer, source_text, question) quads per task across validation steps
         self.val_storage = defaultdict(list)
@@ -40,26 +45,90 @@ class MapperLLMModule(pl.LightningModule):
 
         self.flops_per_step = 0  # set in on_fit_start
 
+        # Precompute <CONTEXT> / </CONTEXT> token IDs for wrapping mapper output
+        ctx_start_id = llm_tokenizer.convert_tokens_to_ids("<CONTEXT>")
+        ctx_end_id   = llm_tokenizer.convert_tokens_to_ids("</CONTEXT>")
+        self.register_buffer("ctx_start_id", torch.tensor([ctx_start_id]))
+        self.register_buffer("ctx_end_id",   torch.tensor([ctx_end_id]))
+
         self.save_hyperparameters(ignore=["embedder", "mapper", "llm", "llm_tokenizer"])
+
+    # -----------------------------
+    # debug helpers
+    # -----------------------------
+    def _dbg(self, msg: str):
+        """Print when debug=True."""
+        if self.debug:
+            print(f"[DEBUG] {msg}", flush=True)
+
+    @staticmethod
+    def _tensor_stats(t: torch.Tensor, name: str) -> str:
+        """One-line summary of a tensor for debug output."""
+        f = t.detach().float()
+        return (
+            f"{name}: shape={list(t.shape)} dtype={t.dtype} "
+            f"mean={f.mean():.4f} std={f.std():.4f} "
+            f"min={f.min():.4f} max={f.max():.4f}"
+        )
+
+    # -----------------------------
+    # helpers
+    # -----------------------------
+    def _wrap_context(self, h: torch.Tensor) -> torch.Tensor:
+        """Prepend <CONTEXT> and append </CONTEXT> embeddings around mapper output h.
+
+        Args:
+            h: [B, S, D_llm]
+        Returns:
+            [B, S+2, D_llm]
+        """
+        get_embeds = self.llm.model.get_input_embeddings()
+        B = h.size(0)
+        ctx_s = get_embeds(self.ctx_start_id.unsqueeze(0)).expand(B, -1, -1)  # [B, 1, D]
+        ctx_e = get_embeds(self.ctx_end_id.unsqueeze(0)).expand(B, -1, -1)    # [B, 1, D]
+        # Cast h to the embedding dtype (bf16 on GPU, fp32 on CPU) before concat
+        h = h.to(ctx_s.dtype)
+        return torch.cat([ctx_s, h, ctx_e], dim=1)  # [B, S+2, D]
 
     # -----------------------------
     # forward
     # -----------------------------
     def forward(self, batch):
-        source_input_ids = batch["source_input_ids"]
+        source_input_ids      = batch["source_input_ids"]
         source_attention_mask = batch["source_attention_mask"]
+
+        if self.debug:
+            real  = source_attention_mask.sum().item()
+            total = source_attention_mask.numel()
+            self._dbg(
+                f"source tokens: {real}/{total} real "
+                f"({100*real/total:.0f}%) across {source_input_ids.size(0)} samples"
+            )
 
         z = self.embedder(
             input_ids=source_input_ids,
             attention_mask=source_attention_mask
         )
-        # z: [B, S, D_e]
+        self._dbg(self._tensor_stats(z, "embedder z"))
 
-        h = self.mapper(z)
-        # h: [B, S, D_llm]
+        h_raw = self.mapper(z, source_attention_mask)
+        self._dbg(self._tensor_stats(h_raw, "mapper h_raw"))
+        h = self._wrap_context(h_raw)
+        # h: [B, n_ctx+2, D_llm]
 
-        target_input_ids = batch["target_input_ids"]
+        target_input_ids      = batch["target_input_ids"]
         target_attention_mask = batch["target_attention_mask"]
+
+        if self.debug:
+            labels_raw = batch["labels"]
+            active = (labels_raw != -100).sum().item()
+            tot    = labels_raw.numel()
+            self._dbg(f"labels: {active}/{tot} active ({100*active/tot:.1f}%)")
+            tgt_real = target_input_ids[0][target_attention_mask[0].bool()]
+            self._dbg(
+                f"target[0] decoded: "
+                f"{repr(self.llm_tokenizer.decode(tgt_real.tolist())[:200])}"
+            )
 
         target_embeds = self.llm.model.get_input_embeddings()(target_input_ids)
 
@@ -102,6 +171,10 @@ class MapperLLMModule(pl.LightningModule):
         outputs = self(batch)
         loss = outputs.loss
 
+        # Guard against degenerate batches (all-masked labels → NaN/inf loss)
+        if not torch.isfinite(loss):
+            return None
+
         self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True)
         self.log(
             "train/cumulative_flops",
@@ -112,15 +185,17 @@ class MapperLLMModule(pl.LightningModule):
         return loss
 
     def on_before_optimizer_step(self, optimizer):
-        """Log gradient norm of the mapper (only trainable component)."""
-        norms = [
-            p.grad.detach().norm(2)
-            for p in self.mapper.parameters()
-            if p.grad is not None
-        ]
-        if norms:
-            total_norm = torch.stack(norms).norm(2).item()
-            self.log("train/mapper_grad_norm", total_norm, prog_bar=False, on_step=True)
+        """Log gradient norms of all trainable components."""
+        def _grad_norm(params):
+            norms = [p.grad.detach().norm(2) for p in params if p.grad is not None]
+            return torch.stack(norms).norm(2).item() if norms else 0.0
+
+        mapper_norm = _grad_norm(self.mapper.parameters())
+        self.log("train/mapper_grad_norm", mapper_norm, prog_bar=False, on_step=True)
+
+        if self.embedder.trainable:
+            emb_norm = _grad_norm(self.embedder.parameters())
+            self.log("train/embedder_grad_norm", emb_norm, prog_bar=False, on_step=True)
 
         lr = optimizer.param_groups[0]["lr"]
         self.log("train/lr", lr, prog_bar=False, on_step=True)
@@ -129,55 +204,101 @@ class MapperLLMModule(pl.LightningModule):
     # validation
     # -----------------------------
     def validation_step(self, batch, batch_idx):
-
-        # ===== teacher-forcing loss =====
-        outputs = self(batch)
-        val_loss = outputs.loss
-        self.log("val/loss", val_loss, prog_bar=True)
-
-        # ===== free generation =====
-        source_input_ids = batch["source_input_ids"]
+        source_input_ids      = batch["source_input_ids"]
         source_attention_mask = batch["source_attention_mask"]
-
-        answers   = batch.get("answer",      [""] * source_input_ids.size(0))
         tasks     = batch.get("task",        ["default"] * source_input_ids.size(0))
+        answers   = batch.get("answer",      [""] * source_input_ids.size(0))
         src_texts = batch.get("source_text", [""] * source_input_ids.size(0))
         questions = batch.get("question",    [""] * source_input_ids.size(0))
-
         get_embeds = self.llm.model.get_input_embeddings()
-        preds = []
 
-        with torch.no_grad():
-            z = self.embedder(
-                input_ids=source_input_ids,
-                attention_mask=source_attention_mask
-            )
-            h = self.mapper(z)  # [B, S, D_llm]
+        # ─── Single embedder + mapper pass (shared for loss and generation) ───
+        z = self.embedder(
+            input_ids=source_input_ids,
+            attention_mask=source_attention_mask
+        )
+        h = self._wrap_context(self.mapper(z, source_attention_mask))  # [B, n_ctx+2, D]
 
-            for i, task in enumerate(tasks):
-                hi = h[i:i+1]  # [1, S, D_llm]
+        # ─── Teacher-forcing loss (no second embedder call) ───────────────
+        target_input_ids      = batch["target_input_ids"]
+        target_attention_mask = batch["target_attention_mask"]
+        target_embeds         = get_embeds(target_input_ids)
+        inputs_embeds         = torch.cat([h, target_embeds], dim=1)
+        source_mask           = torch.ones(
+            h.size(0), h.size(1), device=h.device, dtype=target_attention_mask.dtype
+        )
+        attention_mask  = torch.cat([source_mask, target_attention_mask], dim=1)
+        labels          = batch["labels"]
+        prefix_ignore   = torch.full(
+            (labels.size(0), h.size(1)), -100, device=labels.device
+        )
+        labels_full     = torch.cat([prefix_ignore, labels], dim=1)
+        val_loss = self.llm(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            labels=labels_full
+        ).loss
+        self.log("val/loss", val_loss, prog_bar=True)
 
-                if task == "qa":
-                    # Provide the question as a text prefix so the model can answer it.
-                    # This matches the training layout:
-                    #   [h] [<QA> question <ANSWER>] → generate answer
-                    q_text = f"<QA> {questions[i]} <ANSWER>"
-                    q_ids = self.llm_tokenizer(
-                        q_text, add_special_tokens=False, return_tensors="pt"
-                    ).input_ids.to(hi.device)
-                    q_embeds = get_embeds(q_ids)          # [1, L_q, D_llm]
-                    gen_input = torch.cat([hi, q_embeds], dim=1)
+        if not self.val_generate:
+            return val_loss
+
+        # ─── Batched free generation (grouped by task) ────────────────────
+        preds: list[str] = [""] * len(tasks)
+
+        task_groups: dict[str, list[int]] = {}
+        for i, t in enumerate(tasks):
+            task_groups.setdefault(t, []).append(i)
+
+        with torch.inference_mode():
+            for task_name, indices in task_groups.items():
+                h_group = h[indices]  # [G, n_ctx+2, D]
+
+                # Empty thinking block: tells Qwen3 to skip thinking mode.
+                # Must match the bypass prepended in data_module.tokenize().
+                _bypass = "<think>\n</think>\n\n"
+
+                if task_name == "qa":
+                    prefix_texts = [f"{_bypass}<QA> {questions[i]} <ANSWER>" for i in indices]
                 else:
-                    # Narrative: generate the reconstruction from h alone.
-                    gen_input = hi
+                    prefix_texts = [f"{_bypass}<REPRODUCE>"] * len(indices)
+
+                self._dbg(
+                    f"val gen task={task_name} n={len(indices)} "
+                    f"prefix[0]={repr(prefix_texts[0][:80])}"
+                )
+
+                # Batch-tokenize all prefixes for this task group in one call
+                enc = self.llm_tokenizer(
+                    prefix_texts,
+                    add_special_tokens=False,
+                    padding=True,
+                    return_tensors="pt",
+                )
+                prefix_ids    = enc.input_ids.to(h.device)     # [G, L_p]
+                prefix_mask   = enc.attention_mask.to(h.device) # [G, L_p]
+                prefix_embeds = get_embeds(prefix_ids)          # [G, L_p, D]
+
+                gen_input = torch.cat([h_group, prefix_embeds], dim=1)
+                h_mask    = torch.ones(
+                    len(indices), h_group.size(1),
+                    device=h.device, dtype=torch.long
+                )
+                gen_mask  = torch.cat([h_mask, prefix_mask], dim=1)
 
                 out = self.llm.generate(
                     inputs_embeds=gen_input,
+                    attention_mask=gen_mask,
                     max_new_tokens=64,
                     pad_token_id=self.llm_tokenizer.pad_token_id,
+                    repetition_penalty=1.3,
                 )
-                preds.append(
-                    self.llm_tokenizer.decode(out[0], skip_special_tokens=True)
+
+                for j, idx in enumerate(indices):
+                    preds[idx] = self.llm_tokenizer.decode(out[j], skip_special_tokens=True)
+
+                self._dbg(
+                    f"val gen done pred[0]={repr(preds[indices[0]][:100])}"
                 )
 
         for p, ans, src, q, task in zip(preds, answers, src_texts, questions, tasks):
@@ -186,10 +307,24 @@ class MapperLLMModule(pl.LightningModule):
         return val_loss
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(
+        optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, self.parameters()),
             lr=self.lr,
         )
+
+        if self.warmup_steps == 0:
+            return optimizer
+
+        total_steps = self.trainer.estimated_stepping_batches
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=self.warmup_steps,
+            num_training_steps=total_steps,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+        }
 
     # -----------------------------
     # epoch end
@@ -197,8 +332,8 @@ class MapperLLMModule(pl.LightningModule):
     def on_fit_start(self):
         """Analytical FLOPs per training step."""
         self.flops_forward_embedder = self.embedder.forward_flops()
-        self.flops_forward_mapper = self.mapper.forward_flops()
-        self.flops_forward_llm = self.llm.forward_flops()
+        self.flops_forward_mapper   = self.mapper.forward_flops()
+        self.flops_forward_llm      = self.llm.forward_flops()
 
         trainable_flops = 0
         if self.embedder.trainable:
@@ -215,11 +350,6 @@ class MapperLLMModule(pl.LightningModule):
             2 * trainable_flops
         )
 
-        # File "/Users/kirill/My Folder/study/thesis/experiments/venv/lib/python3.9/site-packages/pytorch_lightning/trainer/connectors/logger_connector/fx_validator.py", line 161, in check_logging
-        # raise MisconfigurationException(
-        # lightning_fabric.utilities.exceptions.MisconfigurationException: You can't `self.log()` inside `on_fit_start`. HINT: You can still log directly to the logger by using `self.logger.experiment`.
-        # self.log("train/flops_per_step", float(self.flops_per_step), on_step=False, on_epoch=False)
-
     def on_validation_epoch_end(self):
         for task, quads in self.val_storage.items():
             preds = [p   for p, _, _, _ in quads]
@@ -227,8 +357,8 @@ class MapperLLMModule(pl.LightningModule):
             srcs  = [src for _, _, src, _ in quads]
             qs    = [q   for _, _, _, q in quads]
 
-            rouge_scores = self.rouge.compute(predictions=preds, references=refs)
-            bleu_score   = self.bleu.compute(predictions=preds, references=[[r] for r in refs])
+            rouge_scores = rouge_l(preds, refs)
+            bleu_score   = bleu4(preds, refs)
             token_acc    = self.compute_token_accuracy(preds, refs)
 
             prefix_len, em = self.compute_prefix_metrics(preds, refs)
@@ -244,7 +374,7 @@ class MapperLLMModule(pl.LightningModule):
         self.val_storage.clear()
 
     # -----------------------------
-    # helpers
+    # metrics / logging helpers
     # -----------------------------
     def compute_token_accuracy(self, preds, refs):
         correct = 0

@@ -3,3 +3,4 @@ venv/
 runs/
 data/
 *.ipynb
+model_cache
