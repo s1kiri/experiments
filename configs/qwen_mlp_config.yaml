@@ -1,12 +1,13 @@
 experiment:
-  name: pooled_qwen_ctx1    # rename per run: ctx1 → ctx4 → ctx8 → ctx16 → ctx32
-  seed: 42
+  name: pooled_qwen_trainable_emb_ctx16   # rename per run: ctx1 → ctx4 → ctx8 → ctx16 → ctx32
+  seed: 20222022
   output_dir: runs/
 
 data:
-  batch_size: 1            # safe on H100; try 32 after verifying no OOM
-  num_workers: 4
-  n_samples: 100            # increase for real runs
+  batch_size: 16           # safe on H100; try 32 after verifying no OOM
+  num_workers: 16
+  n_samples_train: 1000000  # increase / decrease as needed
+  n_samples_val: 5000        # kept small so val+generate stays fast
 
 models:
   cache_dir: model_cache    # local dir for downloaded weights; null → use HF default cache
@@ -21,12 +22,12 @@ models:
     params:
       in_dim: 1024
       out_dim: 1024
-      n_ctx_tokens: 1       # experimental axis: 1 → 4 → 8 → 16 → 32
+      n_ctx_tokens: 16      # experimental axis: 1 → 4 → 8 → 16 → 32
     trainable: true
 
   llm:
     name: Qwen/Qwen3-0.6B
-    trainable: false
+    trainable: true
     max_length: 256
 
 training:
@@ -34,15 +35,24 @@ training:
   warmup_steps: 200         # linear warmup then cosine decay
   max_epochs: 10
   gradient_clip_val: 1.0
-  precision: "bf16"   # H100 native; do NOT use 16 (fp16 GradScaler breaks on bf16 weights)
+  precision: "bf16"         # H100 native; do NOT use 16 (fp16 GradScaler breaks on bf16 weights)
+  num_vals_per_epoch: 4     # GPU: validate 4× per epoch (every 25%); CPU: always 1× (auto)
 
 logging:
   tensorboard: true
   log_every_n_steps: 10
 
 compute:
-  device: cpu            # training device: "cpu" | "cuda:0" | "cuda:1" | ...
+  device: cpu               # training device: "cpu" | "cuda:0" | "cuda:1" | ...
   target_metric: null
 
-debug: true             # true → verbose prints in forward/collate (shapes, stats, decoded targets)
-val_generate: true       # false → skip free generation in validation (faster CPU iteration)
+debug: false                # true → verbose prints in forward/collate (shapes, stats, decoded targets)
+val_generate: true          # false → skip free generation in validation (faster CPU iteration)
+
+checkpointing:
+  enabled: true
+  monitor: "val/loss"       # metric to track for top-k selection
+  mode: "min"               # "min" for loss, "max" for accuracy-like metrics
+  save_top_k: 3             # keep 3 best checkpoints + last
+  save_last: true           # always keep last.ckpt (for resuming)
+  # Checkpoints are saved to: <output_dir>/<experiment.name>/version_N/checkpoints/

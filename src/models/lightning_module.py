@@ -31,6 +31,12 @@ class MapperLLMModule(pl.LightningModule):
         self.mapper = mapper
         self.llm = llm
         self.llm_tokenizer = llm_tokenizer
+
+        # Give mappers that need LLM weight references (e.g. AlignVLMMapper) a
+        # chance to bind them. setup_llm() is called here so vocab_size is
+        # already correct (train.py calls resize_token_embeddings before __init__).
+        if hasattr(mapper, 'setup_llm'):
+            mapper.setup_llm(llm.model)
         self.lr = lr
         self.warmup_steps = warmup_steps
         self.val_generate = val_generate
@@ -52,6 +58,29 @@ class MapperLLMModule(pl.LightningModule):
         self.register_buffer("ctx_end_id",   torch.tensor([ctx_end_id]))
 
         self.save_hyperparameters(ignore=["embedder", "mapper", "llm", "llm_tokenizer"])
+
+    # -----------------------------
+    # helpers
+    # -----------------------------
+    @staticmethod
+    def _strip_thinking(text: str) -> str:
+        """Remove Qwen3 <think>…</think> blocks and stray tags.
+
+        <think>/<</think> are vocabulary tokens, not special tokens, so
+        skip_special_tokens=True in decode() does NOT strip them.
+        The bypass prefix reduces thinking-block generation but doesn't
+        eliminate it (QA context can re-trigger it after <ANSWER>).
+        """
+        import re
+        text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
+        text = text.replace('<think>', '').replace('</think>', '')
+        return text.strip()
+
+    @staticmethod
+    def _trunc_words(text: str, n: int) -> str:
+        """Truncate to at most n whitespace-split tokens."""
+        toks = text.split()
+        return " ".join(toks[:n]) if len(toks) > n else text
 
     # -----------------------------
     # debug helpers
@@ -291,11 +320,14 @@ class MapperLLMModule(pl.LightningModule):
                     attention_mask=gen_mask,
                     max_new_tokens=64,
                     pad_token_id=self.llm_tokenizer.pad_token_id,
+                    eos_token_id=self.llm_tokenizer.eos_token_id,
                     repetition_penalty=1.3,
                 )
 
                 for j, idx in enumerate(indices):
-                    preds[idx] = self.llm_tokenizer.decode(out[j], skip_special_tokens=True)
+                    preds[idx] = self._strip_thinking(
+                        self.llm_tokenizer.decode(out[j], skip_special_tokens=True)
+                    )
 
                 self._dbg(
                     f"val gen done pred[0]={repr(preds[indices[0]][:100])}"
@@ -357,17 +389,24 @@ class MapperLLMModule(pl.LightningModule):
             srcs  = [src for _, _, src, _ in quads]
             qs    = [q   for _, _, _, q in quads]
 
-            rouge_scores = rouge_l(preds, refs)
-            bleu_score   = bleu4(preds, refs)
-            token_acc    = self.compute_token_accuracy(preds, refs)
+            # Compute all metrics at multiple word-level cutoffs so that
+            # BLEU brevity penalty and ROUGE recall are computed fairly
+            # (short predictions vs short reference prefixes, not full refs).
+            # @64 ≈ max_new_tokens=64 tokens, the most meaningful cutoff.
+            for cutoff in (64, 128, 256):
+                p_cut = [self._trunc_words(p, cutoff) for p in preds]
+                r_cut = [self._trunc_words(r, cutoff) for r in refs]
 
-            prefix_len, em = self.compute_prefix_metrics(preds, refs)
+                rouge_scores = rouge_l(p_cut, r_cut)
+                bleu_score   = bleu4(p_cut, r_cut)
+                tok_acc      = self.compute_token_accuracy(p_cut, r_cut)
+                prefix_len, prefix_ratio = self.compute_prefix_metrics(p_cut, r_cut, cutoff)
 
-            self.log(f"val/{task}/rougeL",          rouge_scores["rougeL"])
-            self.log(f"val/{task}/bleu",             bleu_score["bleu"])
-            self.log(f"val/{task}/token_acc",        token_acc)
-            self.log(f"val/{task}/prefix_match_len", prefix_len)
-            self.log(f"val/{task}/em",               em)
+                self.log(f"val/{task}/rougeL@{cutoff}",      rouge_scores["rougeL"])
+                self.log(f"val/{task}/bleu@{cutoff}",         bleu_score["bleu"])
+                self.log(f"val/{task}/tok_acc@{cutoff}",      tok_acc)
+                self.log(f"val/{task}/prefix_len@{cutoff}",   prefix_len)
+                self.log(f"val/{task}/prefix_ratio@{cutoff}", prefix_ratio)
 
             self._log_val_table(task, preds, refs, srcs, qs)
 
@@ -389,19 +428,20 @@ class MapperLLMModule(pl.LightningModule):
             total += min_len
         return correct / total if total > 0 else 0.0
 
-    def compute_prefix_metrics(self, preds, refs):
+    def compute_prefix_metrics(self, preds, refs, cutoff: int):
         """
-        prefix_match_len: average number of whitespace-tokens matched consecutively
-                          from position 0 until the first mismatch.
+        prefix_len:   average number of whitespace-tokens matched consecutively
+                      from position 0 until the first mismatch.
 
-        em (Exact Match prefix ratio): prefix_match_len / len(ref_tokens).
-            Example: if the first 256 of 512 reference tokens are perfectly restored,
-            em = 256 / 512 = 0.5.
+        prefix_ratio: prefix_len / min(cutoff, len(ref_tokens)).
+                      Proportion of the reference (up to cutoff) reproduced
+                      verbatim from the start.  E.g. 0.84 means 84% of the
+                      first `cutoff` reference words were predicted in order.
 
         Both are averaged over the batch.
         """
         prefix_lens = []
-        em_scores   = []
+        ratios      = []
         for p, r in zip(preds, refs):
             p_toks = p.split()
             r_toks = r.split()
@@ -411,11 +451,12 @@ class MapperLLMModule(pl.LightningModule):
                     match_len += 1
                 else:
                     break
+            denom = min(cutoff, len(r_toks)) if r_toks else 1
             prefix_lens.append(match_len)
-            em_scores.append(match_len / len(r_toks) if r_toks else 0.0)
+            ratios.append(match_len / denom)
         avg_prefix = sum(prefix_lens) / len(prefix_lens) if prefix_lens else 0.0
-        avg_em     = sum(em_scores)   / len(em_scores)   if em_scores   else 0.0
-        return avg_prefix, avg_em
+        avg_ratio  = sum(ratios)      / len(ratios)      if ratios      else 0.0
+        return avg_prefix, avg_ratio
 
     def _log_val_table(self, task, preds, refs, srcs, questions):
         """Write a sample table to TensorBoard as markdown text."""

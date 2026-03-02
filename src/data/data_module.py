@@ -217,12 +217,25 @@ class TextDataModule(pl.LightningDataModule):
             add_special_tokens=False,
         ).input_ids
 
-        answer_ids = self.llm_tok(
-            answer_text,
-            truncation=True,
-            max_length=max(1, self.llm_max_length - len(prefix_ids)),
-            add_special_tokens=False,
-        ).input_ids
+        budget = max(1, self.llm_max_length - len(prefix_ids))
+        eos_id = self.llm_tok.eos_token_id
+
+        if task == "qa" and eos_id is not None:
+            # Reserve 1 slot so EOS fits after the (possibly truncated) answer.
+            # This teaches the model to stop after short QA answers.
+            answer_ids = self.llm_tok(
+                answer_text,
+                truncation=True,
+                max_length=max(1, budget - 1),
+                add_special_tokens=False,
+            ).input_ids + [eos_id]
+        else:
+            answer_ids = self.llm_tok(
+                answer_text,
+                truncation=True,
+                max_length=budget,
+                add_special_tokens=False,
+            ).input_ids
 
         return {
             "source_text":           example["source_text"],

@@ -41,11 +41,16 @@ class HFLLM(torch.nn.Module, BaseModel):
         )
 
     def forward_flops(self):
-        # GPT-style transformer FLOPs
-        d = self.hidden_size
-        L = self.num_layers
-        T = self.max_length
+        # Qwen3-style transformer: GQA attention + SwiGLU FFN
+        cfg = self.model.config
+        d         = self.hidden_size
+        L         = self.num_layers
+        T         = self.max_length
+        kv_factor = getattr(cfg, 'num_key_value_heads', self.num_heads) / self.num_heads
+        d_ff      = getattr(cfg, 'intermediate_size', 4 * d)
 
-        # attention + mlp
-        flops = 2 * L * (4 * d * d + 2 * d * T) * T
-        return flops
+        # Attention: Q + K(GQA) + V(GQA) + O projections + QKᵀ + AV
+        attn = 2 * T * d * d * (2 + 2 * kv_factor) + 4 * T * T * d
+        # SwiGLU FFN: gate + up + down (3 matrices of shape d × d_ff)
+        ffn  = 6 * T * d * d_ff
+        return L * (attn + ffn)

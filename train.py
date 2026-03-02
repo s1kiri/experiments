@@ -2,6 +2,7 @@ import os
 import yaml
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.callbacks import ModelCheckpoint
 from transformers import AutoTokenizer
 import torch
 from datasets import load_from_disk
@@ -135,6 +136,22 @@ def main(config_path: str, train_ds, val_ds):
     )
 
     # --------------------
+    # checkpointing
+    # --------------------
+    ckpt_cfg = cfg.get("checkpointing", {})
+    callbacks = []
+    if ckpt_cfg.get("enabled", True):
+        callbacks.append(ModelCheckpoint(
+            monitor=ckpt_cfg.get("monitor", "val/loss"),
+            mode=ckpt_cfg.get("mode", "min"),
+            save_top_k=ckpt_cfg.get("save_top_k", 3),
+            save_last=ckpt_cfg.get("save_last", True),
+            filename="epoch={epoch:02d}-step={step:08d}",
+            auto_insert_metric_name=False,
+            # dirpath defaults to <logger.log_dir>/checkpoints/
+        ))
+
+    # --------------------
     # trainer
     # --------------------
     if device_str.startswith("cuda"):
@@ -148,14 +165,24 @@ def main(config_path: str, train_ds, val_ds):
         devices = 1
         precision = 32  # fp16 is unsupported on CPU
 
+    # Mid-epoch validation: GPU uses num_vals_per_epoch, CPU always validates once
+    # per epoch (generate() is prohibitively slow on CPU for frequent checks).
+    num_vals_per_epoch = cfg["training"].get("num_vals_per_epoch", 1)
+    if device_str.startswith("cuda"):
+        val_check_interval = 1.0 / num_vals_per_epoch
+    else:
+        val_check_interval = 1.0
+
     trainer = pl.Trainer(
         max_epochs=cfg["training"]["max_epochs"],
         logger=logger,
+        callbacks=callbacks,
         log_every_n_steps=cfg["logging"]["log_every_n_steps"],
         gradient_clip_val=cfg["training"]["gradient_clip_val"],
         precision=precision,
         accelerator=accelerator,
         devices=devices,
+        val_check_interval=val_check_interval,
     )
 
     trainer.fit(model, datamodule=datamodule)
@@ -169,18 +196,16 @@ if __name__ == "__main__":
     cfg = load_config(config_path)
 
     dataset  = load_from_disk("data/unified_dataset")
-    n_samples = cfg["data"]["n_samples"]
-    seed      = cfg["experiment"]["seed"]
+    seed     = cfg["experiment"]["seed"]
+    n_train  = cfg["data"].get("n_samples_train") or None   # None = use all remaining
+    n_val    = cfg["data"].get("n_samples_val", 1000)
 
-    # Shuffle → take n_samples → stratified 90/10 split by task
-    sampled = (
-        dataset["train"]
-        .shuffle(seed=seed)
-        .select(range(min(n_samples, len(dataset["train"]))))
-    )
-    # stratify_by_column="task"
-    splits   = sampled.train_test_split(test_size=0.1, seed=seed)
-    train_ds = splits["train"]
-    val_ds   = splits["test"]
+    # Carve out val first (no overlap with train), then take n_samples_train from rest.
+    shuffled     = dataset["train"].shuffle(seed=seed)
+    n_val_actual = min(n_val, len(shuffled))
+    val_ds       = shuffled.select(range(n_val_actual))
+    remaining    = shuffled.select(range(n_val_actual, len(shuffled)))
+    n_train_actual = min(n_train or len(remaining), len(remaining))
+    train_ds     = remaining.select(range(n_train_actual))
 
     main(config_path, train_ds, val_ds)
