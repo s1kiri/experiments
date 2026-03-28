@@ -28,6 +28,7 @@ class TextDataset(Dataset):
             "answer":                row.get("answer", ""),
             "tokenized_source_text": row.get("tokenized_source_text"),
             "am_source_text":        row.get("am_source_text"),   # precomputed mask
+            "tokenized_part1_text":  row.get("tokenized_part1_text"),  # user turn before context
             "tokenized_target_text": row.get("tokenized_target_text"),
             "n_label_mask":          row.get("n_label_mask", 0),
             "task":                  row.get("task"),
@@ -64,6 +65,14 @@ def text_collate_fn(batch, src_pad_id=0, tgt_pad_id=0, debug=False):
     else:
         source_attention_mask = (source_input_ids != src_pad_id).long()
 
+    # Part-1 tokens: user turn opening + message content (before context tokens)
+    part1_ids = [
+        torch.tensor(sample["tokenized_part1_text"], dtype=torch.long)
+        for sample in batch
+    ]
+    part1_input_ids      = pad_sequence(part1_ids, batch_first=True, padding_value=tgt_pad_id)
+    part1_attention_mask = (part1_input_ids != tgt_pad_id).long()
+
     target_ids = [
         torch.tensor(sample["tokenized_target_text"], dtype=torch.long)
         for sample in batch
@@ -99,7 +108,9 @@ def text_collate_fn(batch, src_pad_id=0, tgt_pad_id=0, debug=False):
         "source_input_ids":      source_input_ids,
         "source_attention_mask": source_attention_mask,
 
-        # llm inputs
+        # llm inputs — part1 is user-turn prefix before context tokens
+        "part1_input_ids":       part1_input_ids,
+        "part1_attention_mask":  part1_attention_mask,
         "target_input_ids":      target_input_ids,
         "target_attention_mask": target_attention_mask,
 
@@ -198,44 +209,49 @@ class TextDataModule(pl.LightningDataModule):
             add_special_tokens=True,
         )
 
-        # Prepend an empty thinking block so Qwen3 skips its thinking mode and
-        # outputs the task response directly.  Without this, Qwen3 (base and
-        # instruct) generates <think>/<tool_call> tokens before any real output.
-        _bypass = "<think>\n</think>\n\n"
+        # Build the LLM sequence in two parts around the context tokens:
+        #
+        #   part1: "<|im_start|>user\n{msg}"         ← user turn open (no close yet)
+        #   [context tokens injected here as embeddings]
+        #   part2: "<|im_end|>\n<|im_start|>assistant\n<think>…</think>\n\n[<REPRODUCE>]"
+        #   answer: "{answer}<|im_end|>"
+        #
+        # Placing context inside the user turn makes it structurally part of the
+        # instruction, so the model learns "question + context → answer".
+        _BYPASS = "<think>\n\n</think>\n\n"
 
         if task == "narrative":
-            prefix_text = f"{_bypass}<REPRODUCE>"
-            answer_text = example["answer"]
+            user_msg = "Reproduce the following text."
         elif task == "qa":
-            prefix_text = f"{_bypass}<QA> {example['question']} <ANSWER>"
-            answer_text = example["answer"]
+            user_msg = example["question"]
         else:
             raise ValueError(f"Unknown task: {task!r}. Expected one of {TASKS}.")
 
-        prefix_ids = self.llm_tok(
-            prefix_text,
+        # Part 1: user turn header + message content (context injected after this)
+        part1_text = f"<|im_start|>user\n{user_msg}"
+
+        # Part 2: close user turn, open assistant, bypass thinking, optional task token
+        if task == "narrative":
+            part2_text = f"<|im_end|>\n<|im_start|>assistant\n{_BYPASS}<REPRODUCE>"
+        else:
+            part2_text = f"<|im_end|>\n<|im_start|>assistant\n{_BYPASS}"
+
+        part1_ids = self.llm_tok(part1_text, add_special_tokens=False).input_ids
+        part2_ids = self.llm_tok(part2_text, add_special_tokens=False).input_ids
+
+        answer_text = example["answer"]
+        budget = max(1, self.llm_max_length - len(part1_ids) - len(part2_ids))
+        eos_id = self.llm_tok.eos_token_id  # <|im_end|> for Qwen3
+
+        # Reserve 1 slot for EOS so it always fits after the (possibly truncated) answer.
+        answer_ids = self.llm_tok(
+            answer_text,
+            truncation=True,
+            max_length=max(1, budget - 1),
             add_special_tokens=False,
         ).input_ids
-
-        budget = max(1, self.llm_max_length - len(prefix_ids))
-        eos_id = self.llm_tok.eos_token_id
-
-        if task == "qa" and eos_id is not None:
-            # Reserve 1 slot so EOS fits after the (possibly truncated) answer.
-            # This teaches the model to stop after short QA answers.
-            answer_ids = self.llm_tok(
-                answer_text,
-                truncation=True,
-                max_length=max(1, budget - 1),
-                add_special_tokens=False,
-            ).input_ids + [eos_id]
-        else:
-            answer_ids = self.llm_tok(
-                answer_text,
-                truncation=True,
-                max_length=budget,
-                add_special_tokens=False,
-            ).input_ids
+        if eos_id is not None:
+            answer_ids = answer_ids + [eos_id]
 
         return {
             "source_text":           example["source_text"],
@@ -245,6 +261,7 @@ class TextDataModule(pl.LightningDataModule):
             "id":                    example["id"],
             "tokenized_source_text": src_enc["input_ids"],
             "am_source_text":        src_enc["attention_mask"],
-            "tokenized_target_text": prefix_ids + answer_ids,
-            "n_label_mask":          len(prefix_ids),
+            "tokenized_part1_text":  part1_ids,
+            "tokenized_target_text": part2_ids + answer_ids,  # part2 prefix + answer
+            "n_label_mask":          len(part2_ids),           # mask part2, train on answer
         }

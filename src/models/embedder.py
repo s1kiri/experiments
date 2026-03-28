@@ -16,7 +16,8 @@ class HFEmbedder(torch.nn.Module, BaseModel):
             p.requires_grad = trainable
 
         self.hidden_size = self.model.config.hidden_size
-        self.num_layers = self.model.config.num_hidden_layers
+        self.num_layers  = self.model.config.num_hidden_layers
+        self.num_heads   = getattr(self.model.config, 'num_attention_heads', 12)
 
     def forward(self, input_ids, attention_mask):
         return self.model(

@@ -29,6 +29,14 @@ models:
     name: Qwen/Qwen3-0.6B
     trainable: true
     max_length: 256
+    # ── LoRA (optional) ────────────────────────────────────────────────────
+    # Uncomment to use LoRA instead of full LLM fine-tuning.
+    # Set trainable: false above when enabling LoRA (base weights stay frozen).
+    # lora:
+    #   r: 16
+    #   alpha: 32
+    #   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+    #   dropout: 0.0
 
 training:
   lr: 0.0001
@@ -48,6 +56,12 @@ compute:
 
 debug: false                # true → verbose prints in forward/collate (shapes, stats, decoded targets)
 val_generate: true          # false → skip free generation in validation (faster CPU iteration)
+
+# ── Soft-prompt (optional) ───────────────────────────────────────────────────
+# Learnable vectors inserted inside the user turn, after </CONTEXT> and before <|im_end|>.
+# Works best with trainable: false on the LLM (frozen backbone + learned prompt).
+soft_prompt:
+  n_tokens: 0   # 0 = disabled; e.g. 20 for 20 learnable soft-prompt vectors
 
 checkpointing:
   enabled: true

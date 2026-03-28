@@ -24,6 +24,7 @@ class MapperLLMModule(pl.LightningModule):
         target_metric: None = None,
         val_generate: bool = True,
         debug: bool = False,
+        soft_prompt_tokens: int = 0,
     ):
         super().__init__()
 
@@ -37,6 +38,17 @@ class MapperLLMModule(pl.LightningModule):
         # already correct (train.py calls resize_token_embeddings before __init__).
         if hasattr(mapper, 'setup_llm'):
             mapper.setup_llm(llm.model)
+
+        # Soft-prompt: p learnable vectors prepended after _wrap_context(mapper output).
+        # LLM base is frozen; full backward still flows through LLM to reach these params.
+        self.soft_prompt_tokens = soft_prompt_tokens
+        if soft_prompt_tokens > 0:
+            self.soft_prompt = torch.nn.Parameter(
+                torch.zeros(1, soft_prompt_tokens, llm.hidden_size)
+            )
+        else:
+            self.soft_prompt = None
+
         self.lr = lr
         self.warmup_steps = warmup_steps
         self.val_generate = val_generate
@@ -145,6 +157,10 @@ class MapperLLMModule(pl.LightningModule):
         h = self._wrap_context(h_raw)
         # h: [B, n_ctx+2, D_llm]
 
+        if self.soft_prompt is not None:
+            sp = self.soft_prompt.expand(h.size(0), -1, -1).to(h.dtype)
+            h = torch.cat([h, sp], dim=1)  # [B, n_ctx+2+p, D_llm]
+
         target_input_ids      = batch["target_input_ids"]
         target_attention_mask = batch["target_attention_mask"]
 
@@ -159,31 +175,30 @@ class MapperLLMModule(pl.LightningModule):
                 f"{repr(self.llm_tokenizer.decode(tgt_real.tolist())[:200])}"
             )
 
-        target_embeds = self.llm.model.get_input_embeddings()(target_input_ids)
+        get_embeds            = self.llm.model.get_input_embeddings()
+        part1_input_ids       = batch["part1_input_ids"]
+        part1_attention_mask  = batch["part1_attention_mask"]
 
-        inputs_embeds = torch.cat([h, target_embeds], dim=1)
+        part1_embeds  = get_embeds(part1_input_ids)   # [B, L1, D]
+        target_embeds = get_embeds(target_input_ids)  # [B, L2, D]
 
-        source_mask = torch.ones(
-            h.size(0),
-            h.size(1),
-            device=h.device,
-            dtype=target_attention_mask.dtype
+        # Sequence: [user turn open] [context] [user turn close + assistant + answer]
+        inputs_embeds = torch.cat([part1_embeds, h, target_embeds], dim=1)
+
+        ctx_mask = torch.ones(
+            h.size(0), h.size(1), device=h.device, dtype=target_attention_mask.dtype
         )
-
-        attention_mask = torch.cat(
-            [source_mask, target_attention_mask],
-            dim=1
-        )
+        attention_mask = torch.cat([part1_attention_mask, ctx_mask, target_attention_mask], dim=1)
 
         labels = batch["labels"]
 
-        prefix_ignore = torch.full(
-            (labels.size(0), h.size(1)),
-            -100,
-            device=labels.device
+        part1_ignore = torch.full(
+            (labels.size(0), part1_input_ids.size(1)), -100, device=labels.device
         )
-
-        labels = torch.cat([prefix_ignore, labels], dim=1)
+        ctx_ignore = torch.full(
+            (labels.size(0), h.size(1)), -100, device=labels.device
+        )
+        labels = torch.cat([part1_ignore, ctx_ignore, labels], dim=1)
 
         outputs = self.llm(
             inputs_embeds=inputs_embeds,
@@ -248,20 +263,30 @@ class MapperLLMModule(pl.LightningModule):
         )
         h = self._wrap_context(self.mapper(z, source_attention_mask))  # [B, n_ctx+2, D]
 
+        if self.soft_prompt is not None:
+            sp = self.soft_prompt.expand(h.size(0), -1, -1).to(h.dtype)
+            h = torch.cat([h, sp], dim=1)  # [B, n_ctx+2+p, D]
+
         # ─── Teacher-forcing loss (no second embedder call) ───────────────
+        part1_input_ids       = batch["part1_input_ids"]
+        part1_attention_mask  = batch["part1_attention_mask"]
         target_input_ids      = batch["target_input_ids"]
         target_attention_mask = batch["target_attention_mask"]
+        part1_embeds          = get_embeds(part1_input_ids)
         target_embeds         = get_embeds(target_input_ids)
-        inputs_embeds         = torch.cat([h, target_embeds], dim=1)
-        source_mask           = torch.ones(
+        inputs_embeds         = torch.cat([part1_embeds, h, target_embeds], dim=1)
+        ctx_mask              = torch.ones(
             h.size(0), h.size(1), device=h.device, dtype=target_attention_mask.dtype
         )
-        attention_mask  = torch.cat([source_mask, target_attention_mask], dim=1)
+        attention_mask  = torch.cat([part1_attention_mask, ctx_mask, target_attention_mask], dim=1)
         labels          = batch["labels"]
-        prefix_ignore   = torch.full(
+        part1_ignore    = torch.full(
+            (labels.size(0), part1_input_ids.size(1)), -100, device=labels.device
+        )
+        ctx_ignore      = torch.full(
             (labels.size(0), h.size(1)), -100, device=labels.device
         )
-        labels_full     = torch.cat([prefix_ignore, labels], dim=1)
+        labels_full     = torch.cat([part1_ignore, ctx_ignore, labels], dim=1)
         val_loss = self.llm(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -283,37 +308,41 @@ class MapperLLMModule(pl.LightningModule):
             for task_name, indices in task_groups.items():
                 h_group = h[indices]  # [G, n_ctx+2, D]
 
-                # Empty thinking block: tells Qwen3 to skip thinking mode.
-                # Must match the bypass prepended in data_module.tokenize().
-                _bypass = "<think>\n</think>\n\n"
+                # Build two-part prefix matching data_module.tokenize():
+                # part1 = user turn open + message (before context tokens)
+                # part2 = close user turn + open assistant + bypass (after context tokens)
+                _BYPASS = "<think>\n\n</think>\n\n"
 
                 if task_name == "qa":
-                    prefix_texts = [f"{_bypass}<QA> {questions[i]} <ANSWER>" for i in indices]
+                    part1_texts = [f"<|im_start|>user\n{questions[i]}" for i in indices]
+                    part2_prefix = f"<|im_end|>\n<|im_start|>assistant\n{_BYPASS}"
                 else:
-                    prefix_texts = [f"{_bypass}<REPRODUCE>"] * len(indices)
+                    part1_texts  = [f"<|im_start|>user\nReproduce the following text."] * len(indices)
+                    part2_prefix = f"<|im_end|>\n<|im_start|>assistant\n{_BYPASS}<REPRODUCE>"
+
+                part2_texts = [part2_prefix] * len(indices)
 
                 self._dbg(
                     f"val gen task={task_name} n={len(indices)} "
-                    f"prefix[0]={repr(prefix_texts[0][:80])}"
+                    f"part1[0]={repr(part1_texts[0][:60])}"
                 )
 
-                # Batch-tokenize all prefixes for this task group in one call
-                enc = self.llm_tokenizer(
-                    prefix_texts,
-                    add_special_tokens=False,
-                    padding=True,
-                    return_tensors="pt",
-                )
-                prefix_ids    = enc.input_ids.to(h.device)     # [G, L_p]
-                prefix_mask   = enc.attention_mask.to(h.device) # [G, L_p]
-                prefix_embeds = get_embeds(prefix_ids)          # [G, L_p, D]
+                enc1 = self.llm_tokenizer(part1_texts, add_special_tokens=False,
+                                          padding=True, return_tensors="pt")
+                enc2 = self.llm_tokenizer(part2_texts, add_special_tokens=False,
+                                          padding=True, return_tensors="pt")
+                part1_ids  = enc1.input_ids.to(h.device)
+                part1_mask = enc1.attention_mask.to(h.device)
+                part2_ids  = enc2.input_ids.to(h.device)
+                part2_mask = enc2.attention_mask.to(h.device)
+                part1_embs = get_embeds(part1_ids)   # [G, L1, D]
+                part2_embs = get_embeds(part2_ids)   # [G, L2, D]
 
-                gen_input = torch.cat([h_group, prefix_embeds], dim=1)
-                h_mask    = torch.ones(
-                    len(indices), h_group.size(1),
-                    device=h.device, dtype=torch.long
+                ctx_mask_gen = torch.ones(
+                    len(indices), h_group.size(1), device=h.device, dtype=torch.long
                 )
-                gen_mask  = torch.cat([h_mask, prefix_mask], dim=1)
+                gen_input = torch.cat([part1_embs, h_group, part2_embs], dim=1)
+                gen_mask  = torch.cat([part1_mask, ctx_mask_gen, part2_mask], dim=1)
 
                 out = self.llm.generate(
                     inputs_embeds=gen_input,
@@ -373,6 +402,10 @@ class MapperLLMModule(pl.LightningModule):
         if self.mapper.trainable:
             trainable_flops += self.flops_forward_mapper
         if self.llm.trainable:
+            trainable_flops += self.flops_forward_llm
+        # Soft-prompt: full LLM backward is needed to propagate gradient to the
+        # learned vectors even when the base LLM weights are frozen.
+        if self.soft_prompt is not None and not self.llm.trainable:
             trainable_flops += self.flops_forward_llm
 
         self.flops_per_step = (

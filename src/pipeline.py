@@ -85,6 +85,22 @@ def build_models(config_path: str):
     )
     llm.model.resize_token_embeddings(len(llm_tok))
 
+    # Re-apply LoRA if the config used it during training.
+    # PEFT wraps llm.model and changes state-dict keys (lora_A/lora_B sub-modules);
+    # the architecture must match before load_from_checkpoint can load the weights.
+    lora_cfg = llm_cfg.get("lora")
+    if lora_cfg:
+        from peft import LoraConfig, get_peft_model, TaskType
+        llm.model = get_peft_model(llm.model, LoraConfig(
+            r=lora_cfg.get("r", 16),
+            lora_alpha=lora_cfg.get("alpha", 32),
+            target_modules=lora_cfg.get("target_modules",
+                                        ["q_proj", "k_proj", "v_proj", "o_proj"]),
+            lora_dropout=lora_cfg.get("dropout", 0.0),
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+        ))
+
     return cfg, emb_tok, llm_tok, embedder, mapper, llm
 
 
@@ -106,6 +122,7 @@ def load_pipeline(
     """
     cfg, emb_tok, llm_tok, embedder, mapper, llm = build_models(config_path)
 
+    soft_prompt_tokens = cfg.get("soft_prompt", {}).get("n_tokens", 0)
     module = MapperLLMModule.load_from_checkpoint(
         checkpoint_path,
         map_location=device,
@@ -115,6 +132,7 @@ def load_pipeline(
         mapper=mapper,
         llm=llm,
         llm_tokenizer=llm_tok,
+        soft_prompt_tokens=soft_prompt_tokens,
     )
     module = module.to(device).eval()
     return module, emb_tok, llm_tok
@@ -193,8 +211,13 @@ def _predict_batch(
         z = module.embedder(source_ids, source_mask)
         h = module._wrap_context(module.mapper(z, source_mask))  # [B, k+2, D]
 
+        # Inject soft-prompt if the checkpoint used one
+        if module.soft_prompt is not None:
+            sp = module.soft_prompt.expand(h.size(0), -1, -1).to(h.dtype)
+            h = torch.cat([h, sp], dim=1)  # [B, k+2+p, D]
+
         get_embeds = module.llm.model.get_input_embeddings()
-        _bypass    = "<think>\n</think>\n\n"
+        _BYPASS    = "<think>\n\n</think>\n\n"
 
         # Group by task so each group shares the same prefix template
         task_groups: dict[str, list[int]] = {}
@@ -202,26 +225,29 @@ def _predict_batch(
             task_groups.setdefault(t, []).append(i)
 
         for task_name, indices in task_groups.items():
-            h_group = h[indices]  # [G, k+2, D]
+            h_group = h[indices]  # [G, k+2(+p), D]
 
             if task_name == "qa":
-                prefix_texts = [
-                    f"{_bypass}<QA> {questions[i]} <ANSWER>" for i in indices
-                ]
+                part1_texts = [f"<|im_start|>user\n{questions[i]}" for i in indices]
+                part2_prefix = f"<|im_end|>\n<|im_start|>assistant\n{_BYPASS}"
             else:
-                prefix_texts = [f"{_bypass}<REPRODUCE>"] * len(indices)
+                part1_texts  = [f"<|im_start|>user\nReproduce the following text."] * len(indices)
+                part2_prefix = f"<|im_end|>\n<|im_start|>assistant\n{_BYPASS}<REPRODUCE>"
 
-            enc_p        = llm_tok(prefix_texts, add_special_tokens=False,
-                                   padding=True, return_tensors="pt")
-            prefix_ids   = enc_p.input_ids.to(device)
-            prefix_mask  = enc_p.attention_mask.to(device)
-            prefix_embs  = get_embeds(prefix_ids)
+            part2_texts = [part2_prefix] * len(indices)
 
-            gen_input = torch.cat([h_group, prefix_embs], dim=1)
-            h_mask    = torch.ones(
-                len(indices), h_group.size(1), device=device, dtype=torch.long
-            )
-            gen_mask  = torch.cat([h_mask, prefix_mask], dim=1)
+            enc1 = llm_tok(part1_texts, add_special_tokens=False, padding=True, return_tensors="pt")
+            enc2 = llm_tok(part2_texts, add_special_tokens=False, padding=True, return_tensors="pt")
+            part1_ids  = enc1.input_ids.to(device)
+            part1_mask = enc1.attention_mask.to(device)
+            part2_ids  = enc2.input_ids.to(device)
+            part2_mask = enc2.attention_mask.to(device)
+            part1_embs = get_embeds(part1_ids)
+            part2_embs = get_embeds(part2_ids)
+
+            ctx_mask = torch.ones(len(indices), h_group.size(1), device=device, dtype=torch.long)
+            gen_input = torch.cat([part1_embs, h_group, part2_embs], dim=1)
+            gen_mask  = torch.cat([part1_mask, ctx_mask, part2_mask], dim=1)
 
             out = module.llm.generate(
                 inputs_embeds=gen_input,

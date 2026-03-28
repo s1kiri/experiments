@@ -90,6 +90,24 @@ def main(config_path: str, train_ds, val_ds):
         mean_emb  = emb.weight[:old_vocab].mean(0, keepdim=True)
         emb.weight[old_vocab:] = mean_emb.expand(len(SPECIAL_TOKENS), -1)
 
+    # LoRA: wrap LLM with PEFT adapters (applied after resize_token_embeddings).
+    # When enabled, only LoRA parameters are trainable; base weights stay frozen.
+    # llm.trainable is set to True so FLOPs tracking counts the full backward pass
+    # (gradient must propagate through all frozen layers to reach LoRA weights).
+    lora_cfg = llm_cfg.get("lora")
+    if lora_cfg:
+        from peft import LoraConfig, get_peft_model, TaskType
+        llm.model = get_peft_model(llm.model, LoraConfig(
+            r=lora_cfg.get("r", 16),
+            lora_alpha=lora_cfg.get("alpha", 32),
+            target_modules=lora_cfg.get("target_modules",
+                                        ["q_proj", "k_proj", "v_proj", "o_proj"]),
+            lora_dropout=lora_cfg.get("dropout", 0.0),
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+        ))
+        llm.trainable = True  # gradient flows through full LLM for LoRA params
+
     # Enable gradient checkpointing for a trainable embedder to save activation memory.
     # Only worthwhile on CUDA where ~7-9 GB of activations would OOM the GPU.
     # On CPU memory is abundant and recomputing activations is slower, not faster.
@@ -110,6 +128,7 @@ def main(config_path: str, train_ds, val_ds):
         target_metric=cfg["compute"]["target_metric"],
         val_generate=cfg.get("val_generate", True),
         debug=cfg.get("debug", False),
+        soft_prompt_tokens=cfg.get("soft_prompt", {}).get("n_tokens", 0),
     )
 
     # --------------------
