@@ -70,18 +70,28 @@ def text_collate_fn(batch, src_pad_id=0, tgt_pad_id=0, debug=False):
         torch.tensor(sample["tokenized_part1_text"], dtype=torch.long)
         for sample in batch
     ]
-    part1_input_ids      = pad_sequence(part1_ids, batch_first=True, padding_value=tgt_pad_id)
-    part1_attention_mask = (part1_input_ids != tgt_pad_id).long()
+    part1_input_ids = pad_sequence(part1_ids, batch_first=True, padding_value=tgt_pad_id)
+    # Length-based mask: avoids masking real <|im_end|> tokens when pad_id == eos_id.
+    part1_lens = [len(s["tokenized_part1_text"]) for s in batch]
+    part1_attention_mask = torch.zeros(len(batch), part1_input_ids.size(1), dtype=torch.long)
+    for i, l in enumerate(part1_lens):
+        part1_attention_mask[i, :l] = 1
 
     target_ids = [
         torch.tensor(sample["tokenized_target_text"], dtype=torch.long)
         for sample in batch
     ]
     target_input_ids = pad_sequence(target_ids, batch_first=True, padding_value=tgt_pad_id)
-    target_attention_mask = (target_input_ids != tgt_pad_id).long()
+    # Length-based mask: the final <|im_end|> (EOS) must stay attended so the model
+    # learns to stop. Token-ID comparison would zero it out since pad_id == eos_id.
+    target_lens = [len(s["tokenized_target_text"]) for s in batch]
+    target_attention_mask = torch.zeros(len(batch), target_input_ids.size(1), dtype=torch.long)
+    for i, l in enumerate(target_lens):
+        target_attention_mask[i, :l] = 1
 
     labels = target_input_ids.clone()
-    labels[target_input_ids == tgt_pad_id] = -100
+    for i, l in enumerate(target_lens):
+        labels[i, l:] = -100   # mask padding only — EOS at position l-1 stays trainable
 
     # Mask the task-prefix tokens per example (question for QA, <REPRODUCE> for narrative)
     for i, sample in enumerate(batch):

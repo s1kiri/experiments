@@ -144,6 +144,7 @@ def main(config_path: str, train_ds, val_ds):
         batch_size=cfg["data"]["batch_size"],
         num_workers=cfg["data"]["num_workers"],
         pin_memory=torch.cuda.is_available(),
+        debug=cfg.get("debug", False),
     )
 
     # --------------------
