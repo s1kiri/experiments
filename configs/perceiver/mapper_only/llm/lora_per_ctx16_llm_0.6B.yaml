@@ -1,5 +1,5 @@
 experiment:
-  name: perceiver_ctx16_full_ft   # ← меняй: ctx4 / ctx8 / ctx16 / ctx32
+  name: lora_qwen_06B_perceiver_ctx16   # ← меняй: ctx4 / ctx8 / ctx16 / ctx32
   seed: 20222022
   output_dir: /data/ksidorsky/experiments/runs
 
@@ -7,14 +7,14 @@ data:
   batch_size: 16
   num_workers: 16
   n_samples_train: 1000000
-  n_samples_val: 5000
+  n_samples_val: 2500
 
 models:
   cache_dir: /home/ksidorsky/experiments_new/model_cache
 
   embedder:
     name: Qwen/Qwen3-Embedding-0.6B
-    trainable: true
+    trainable: false
     max_length: 512
 
   mapper:
@@ -29,13 +29,18 @@ models:
 
   llm:
     name: Qwen/Qwen3-0.6B
-    trainable: true               # full fine-tuning
+    trainable: false          # base weights frozen; LoRA adds ~1-2% trainable params
     max_length: 256
+    lora:
+      r: 16
+      alpha: 32
+      target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+      dropout: 0.0
 
 training:
   lr: 0.0001
   warmup_steps: 200
-  max_epochs: 10
+  max_epochs: 1
   gradient_clip_val: 1.0
   precision: "bf16"
   num_vals_per_epoch: 4
@@ -58,5 +63,5 @@ checkpointing:
   enabled: true
   monitor: "val/loss"
   mode: "min"
-  save_top_k: 3
+  save_top_k: 0
   save_last: true

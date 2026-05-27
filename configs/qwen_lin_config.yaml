@@ -1,0 +1,57 @@
+experiment:
+  name: linear_qwens_embedder_mapper_llm_ctx1   # rename per run: ctx1 → ctx4 → ctx8 → ctx16 → ctx32
+  seed: 20222022
+  output_dir: /data/ksidorsky/experiments/runs/
+
+data:
+  batch_size: 16         # safe on H100; try 32 after verifying no OOM
+  num_workers: 16
+  n_samples_train: 1000000  # increase / decrease as needed
+  n_samples_val: 5000        # kept small so val+generate stays fast
+
+models:
+  cache_dir: ../experiments_new/model_cache   # local dir for downloaded weights; null → use HF default cache
+
+  embedder:
+    name: Qwen/Qwen3-Embedding-0.6B
+    trainable: true
+    max_length: 512
+
+  mapper:
+    class: BaseMapper
+    params:
+      in_dim: 1024
+      out_dim: 1024
+    trainable: true
+
+  llm:
+    name: Qwen/Qwen3-0.6B
+    trainable: true
+    max_length: 256
+
+training:
+  lr: 0.0001
+  warmup_steps: 1000         # linear warmup then cosine decay
+  max_epochs: 10
+  gradient_clip_val: 1.0
+  precision: "bf16"         # H100 native; do NOT use 16 (fp16 GradScaler breaks on bf16 weights)
+  num_vals_per_epoch: 4     # GPU: validate 4× per epoch (every 25%); CPU: always 1× (auto)
+
+logging:
+  tensorboard: true
+  log_every_n_steps: 10
+
+compute:
+  device: "cuda:4"               # training device: "cpu" | "cuda:0" | "cuda:1" | ...
+  target_metric: null
+
+debug: false                # true → verbose prints in forward/collate (shapes, stats, decoded targets)
+val_generate: true          # false → skip free generation in validation (faster CPU iteration)
+
+checkpointing:
+  enabled: true
+  monitor: "val/loss"       # metric to track for top-k selection
+  mode: "min"               # "min" for loss, "max" for accuracy-like metrics
+  save_top_k: 1             # keep 3 best checkpoints + last
+  save_last: true           # always keep last.ckpt (for resuming)
+  # Checkpoints are saved to: <output_dir>/<experiment.name>/version_N/checkpoints/

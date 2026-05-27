@@ -3,3 +3,6 @@ venv/
 runs/
 data/
 model_cache
+*.png
+*.csv
+.claude

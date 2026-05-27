@@ -1,16 +1,16 @@
 experiment:
-  name: perceiver_ctx16_full_ft   # ← меняй: ctx4 / ctx8 / ctx16 / ctx32
+  name: perceiver_ctx16_full_ft
   seed: 20222022
-  output_dir: /data/ksidorsky/experiments/runs
+  output_dir: runs
 
 data:
   batch_size: 16
-  num_workers: 16
+  num_workers: 4
   n_samples_train: 1000000
   n_samples_val: 5000
 
 models:
-  cache_dir: /home/ksidorsky/experiments_new/model_cache
+  cache_dir: model_cache   # local path (experiments/model_cache/)
 
   embedder:
     name: Qwen/Qwen3-Embedding-0.6B
@@ -18,18 +18,18 @@ models:
     max_length: 512
 
   mapper:
-    class: PerceiverMapper        # cross-attention resampler (most expressive)
+    class: PerceiverMapper
     params:
       in_dim: 1024
       out_dim: 1024
-      n_ctx_tokens: 16      # ← experimental axis: 4 → 8 → 16 → 32 (min ≥ n_heads)
+      n_ctx_tokens: 16
       n_heads: 8
       n_layers: 2
     trainable: true
 
   llm:
     name: Qwen/Qwen3-0.6B
-    trainable: true               # full fine-tuning
+    trainable: true
     max_length: 256
 
 training:
@@ -45,7 +45,7 @@ logging:
   log_every_n_steps: 10
 
 compute:
-  device: cuda:0
+  device: cpu
   target_metric: null
 
 debug: false

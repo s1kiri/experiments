@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Просмотр предсказаний модели</title>
+<style>
+:root {
+  --bg:        #f0f2f5;
+  --card:      #ffffff;
+  --border:    #e2e8f0;
+  --text:      #1a202c;
+  --muted:     #718096;
+  --nar:       #4C72B0;
+  --nar-light: #90afd4;
+  --qa:        #DD8452;
+  --qa-light:  #edaa7e;
+  --match-bg:  #c6f6d5;
+  --match-fg:  #22543d;
+  --miss-bg:   #fed7d7;
+  --miss-fg:   #742a2a;
+  --beyond-fg: #a0aec0;
+  --hdr:       #1e2a3a;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 14px; }
+
+/* ── Header ── */
+.hdr {
+  position: sticky; top: 0; z-index: 100;
+  background: var(--hdr); color: #fff;
+  padding: 12px 20px; box-shadow: 0 2px 8px rgba(0,0,0,.35);
+}
+.hdr-top { display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+.hdr h1 { font-size:17px; font-weight:700; letter-spacing:.3px; flex:1; min-width:200px; }
+.controls { display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+
+/* Tabs */
+.tabs { display:flex; gap:4px; }
+.tab {
+  padding:5px 14px; border:1px solid rgba(255,255,255,.3);
+  border-radius:20px; background:transparent; color:#cbd5e0;
+  cursor:pointer; font-size:13px; transition:.15s;
+}
+.tab:hover { background:rgba(255,255,255,.1); color:#fff; }
+.tab.active { background:#fff; color:var(--hdr); font-weight:600; border-color:#fff; }
+
+/* Slider */
+.slider-wrap { display:flex; align-items:center; gap:8px; font-size:13px; }
+.slider-wrap label { white-space:nowrap; color:#a0aec0; }
+.slider-wrap strong { color:#fff; min-width:28px; display:inline-block; }
+input[type=range] { width:120px; accent-color:#63b3ed; cursor:pointer; }
+
+/* Search */
+.search-wrap input {
+  padding:5px 10px; border-radius:6px; border:none;
+  background:rgba(255,255,255,.12); color:#fff; font-size:13px;
+  outline:none; width:200px;
+}
+.search-wrap input::placeholder { color:#a0aec0; }
+.search-wrap input:focus { background:rgba(255,255,255,.2); }
+
+/* Stats bar */
+.stats-bar { font-size:12px; color:#718096; padding:5px 20px; background:#fff; border-bottom:1px solid var(--border); }
+
+/* Metrics bar */
+.metrics-bar {
+  border-top:1px solid rgba(255,255,255,.1); padding:8px 20px;
+  display:flex; gap:20px; flex-wrap:wrap; align-items:center;
+}
+.mg { display:flex; align-items:center; gap:12px; }
+.mg-label { font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:.8px; }
+.mi { display:flex; flex-direction:column; gap:2px; }
+.mi-label { font-size:10px; color:#a0aec0; }
+.mi-row { display:flex; align-items:center; gap:7px; }
+.mi-val { font-size:16px; font-weight:800; line-height:1; }
+.mbar { width:72px; height:5px; background:rgba(255,255,255,.15); border-radius:3px; overflow:hidden; }
+.mbar-fill { height:100%; border-radius:3px; transition:width .35s ease; }
+.msep { width:1px; height:28px; background:rgba(255,255,255,.15); margin:0 4px; }
+
+/* ── Content ── */
+.content { max-width:1100px; margin:0 auto; padding:20px; }
+
+/* ── Card ── */
+.card {
+  background:var(--card); border-radius:10px;
+  border:1px solid var(--border); margin-bottom:16px;
+  box-shadow:0 1px 4px rgba(0,0,0,.06);
+  overflow:hidden;
+}
+.card-hdr {
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  padding:10px 16px; border-bottom:1px solid var(--border);
+  background:#f7fafc;
+}
+.badge {
+  font-size:11px; font-weight:700; padding:3px 10px; border-radius:12px;
+  text-transform:uppercase; letter-spacing:.5px;
+}
+.badge-nar  { background:var(--nar); color:#fff; }
+.badge-qa   { background:var(--qa);  color:#fff; }
+.card-id    { font-size:12px; color:var(--muted); font-family:monospace; }
+.card-hdr-right { margin-left:auto; display:flex; align-items:center; gap:8px; }
+
+/* Match badge (narrative) */
+.mbadge {
+  font-size:12px; font-weight:600; padding:3px 10px; border-radius:20px;
+}
+.mbadge-good { background:#c6f6d5; color:#22543d; }
+.mbadge-ok   { background:#fefcbf; color:#744210; }
+.mbadge-bad  { background:#fed7d7; color:#742a2a; }
+
+/* QA score badge */
+.qbadge { font-size:12px; font-weight:600; padding:3px 10px; border-radius:20px; }
+.qbadge-exact { background:#c6f6d5; color:#22543d; }
+.qbadge-good  { background:#bee3f8; color:#2a4365; }
+.qbadge-ok    { background:#fefcbf; color:#744210; }
+.qbadge-bad   { background:#fed7d7; color:#742a2a; }
+
+/* ── Section ── */
+.section { padding:12px 16px; border-bottom:1px solid var(--border); }
+.section:last-child { border-bottom:none; }
+.sec-label {
+  font-size:11px; font-weight:700; text-transform:uppercase;
+  letter-spacing:.6px; color:var(--muted); margin-bottom:6px;
+  display:flex; align-items:center; gap:8px;
+}
+.len-pill {
+  font-size:10px; font-weight:500; padding:1px 7px; border-radius:10px;
+  background:var(--bg); color:var(--muted); font-family:monospace; text-transform:none; letter-spacing:0;
+}
+
+/* ── Token text ── */
+.tok-text {
+  font-family: "SFMono-Regular", Consolas, monospace; font-size:13px;
+  line-height:1.9; word-break:break-word;
+}
+.tok-text span { border-radius:3px; padding:1px 0; }
+.tok-m  { background:var(--match-bg); color:var(--match-fg); }
+.tok-x  { background:var(--miss-bg);  color:var(--miss-fg);  }
+.tok-b  { color:var(--beyond-fg); }
+
+/* Legend */
+.legend {
+  display:flex; gap:12px; flex-wrap:wrap;
+  font-size:11px; color:var(--muted);
+  padding:6px 16px 10px; align-items:center;
+}
+.legend-item { display:flex; align-items:center; gap:4px; }
+.legend-swatch { width:10px; height:10px; border-radius:2px; display:inline-block; }
+
+/* Cutoff marker */
+.cutoff-marker {
+  display:inline-block; border-left:2px dashed #718096;
+  margin:0 2px; height:1em; vertical-align:middle; opacity:.6;
+}
+
+/* ── Source preview (narrative) ── */
+.src-preview {
+  font-size:13px; line-height:1.7; color:#4a5568;
+  max-height:80px; overflow:hidden; transition:max-height .3s ease;
+  cursor:pointer;
+}
+.src-preview.expanded { max-height:500px; }
+.expand-btn {
+  font-size:11px; color:var(--nar); cursor:pointer;
+  text-decoration:underline; margin-top:4px; display:inline-block;
+}
+
+/* ── QA layout ── */
+.qa-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+@media(max-width:640px) { .qa-grid { grid-template-columns:1fr; } }
+.qa-box {
+  border:1px solid var(--border); border-radius:8px; padding:10px 12px;
+  font-size:13px; line-height:1.6;
+}
+.qa-box.exact-match { border-color:#68d391; background:#f0fff4; }
+.qa-box.good-match  { border-color:#90cdf4; background:#ebf8ff; }
+.qa-box.bad-match   { border-color:#fc8181; background:#fff5f5; }
+.qa-box-label { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); margin-bottom:4px; }
+
+.question-box {
+  background:#fffbeb; border:1px solid #f6e05e; border-radius:8px;
+  padding:10px 14px; font-size:14px; font-weight:500; color:#744210;
+  line-height:1.5;
+}
+mark.ans-hl {
+  background:#fefcbf; color:#744210; border-radius:2px;
+  padding:1px 2px; font-weight:600;
+}
+
+/* ── Pagination ── */
+.pagination {
+  display:flex; justify-content:center; align-items:center;
+  gap:8px; padding:24px 0 40px;
+}
+.pg-btn {
+  padding:7px 18px; border-radius:8px; border:1px solid var(--border);
+  background:var(--card); cursor:pointer; font-size:13px; color:var(--text);
+  transition:.15s;
+}
+.pg-btn:hover:not(:disabled) { background:var(--nar); color:#fff; border-color:var(--nar); }
+.pg-btn:disabled { opacity:.4; cursor:not-allowed; }
+.pg-info { font-size:13px; color:var(--muted); padding:0 8px; }
+
+/* Empty */
+.empty { text-align:center; padding:60px; color:var(--muted); font-size:15px; }
+</style>
+</head>
+<script>const DATA=[{"task":"qa","id":"","source_text":"The Apollo 11 mission, launched on July 16, 1969, was the first crewed Moon landing in history. Astronauts Neil Armstrong and Buzz Aldrin landed on the surface in a craft called the Lunar Module Eagle, while Michael Collins stayed in orbit above in the Command Module. Armstrong's first steps on the Moon were shown live on television to around 600 million people worldwide.","question":"How many people watched Armstrong's first steps on the Moon?","answer":"around 600 million people","prediction":"600 million","exact":0,"f1":0.667},{"task":"qa","id":"","source_text":"The Apollo 11 mission, launched on July 16, 1969, was the first crewed Moon landing in history. Astronauts Neil Armstrong and Buzz Aldrin landed on the surface in a craft called the Lunar Module Eagle, while Michael Collins stayed in orbit above in the Command Module. Armstrong's first steps on the Moon were shown live on television to around 600 million people worldwide.","question":"What was Michael Collins doing while the other two astronauts were on the Moon?","answer":"staying in orbit above in the Command Module","prediction":"restored the lunar module","exact":0,"f1":0.333},{"task":"qa","id":"","source_text":"The Apollo 11 mission, launched on July 16, 1969, was the first crewed Moon landing in history. Astronauts Neil Armstrong and Buzz Aldrin landed on the surface in a craft called the Lunar Module Eagle, while Michael Collins stayed in orbit above in the Command Module. Armstrong's first steps on the Moon were shown live on television to around 600 million people worldwide.","question":"What was the name of the craft used to land on the surface in this mission?","answer":"the Lunar Module Eagle","prediction":"Lunar Module Eagle","exact":0,"f1":0.857},{"task":"qa","id":"","source_text":"The Apollo 13 mission launched in April 1970 and was supposed to be the third Moon landing. Two days into the flight, an oxygen tank in the service module exploded. The crew had to move into the small lunar module and use it as a lifeboat. They went around the Moon and returned safely to Earth, and the mission was later called a successful failure because no lives were lost despite the emergency.","question":"What went wrong during the mission described in the text?","answer":"an oxygen tank in the service module exploded","prediction":"no lives were lost because of the emergency","exact":0,"f1":0.125},{"task":"qa","id":"","source_text":"The Apollo 13 mission launched in April 1970 and was supposed to be the third Moon landing. Two days into the flight, an oxygen tank in the service module exploded. The crew had to move into the small lunar module and use it as a lifeboat. They went around the Moon and returned safely to Earth, and the mission was later called a successful failure because no lives were lost despite the emergency.","question":"Why was the outcome described as a successful failure?","answer":"no lives were lost despite the emergency","prediction":"no lives were lost despite the emergency","exact":1,"f1":1.0},{"task":"qa","id":"","source_text":"The Apollo 13 mission launched in April 1970 and was supposed to be the third Moon landing. Two days into the flight, an oxygen tank in the service module exploded. The crew had to move into the small lunar module and use it as a lifeboat. They went around the Moon and returned safely to Earth, and the mission was later called a successful failure because no lives were lost despite the emergency.","question":"How did the crew survive after the explosion described in the text?","answer":"they moved into the small lunar module and used it as a lifeboat","prediction":"the lives were lost because of the emergency","exact":0,"f1":0.095},{"task":"qa","id":"","source_text":"The Black Death was a disease that spread across Europe between 1347 and 1351, killing between 30 and 60 percent of the population. It was caused by a type of bacteria carried by fleas that lived on rats traveling on trade ships. The huge loss of people caused labor shortages, which meant that surviving workers could ask for higher pay and better conditions — helping to slowly end the system of serfdom in Western Europe.","question":"How did the disease described in the text spread across Europe?","answer":"through fleas carried by rats on trade ships","prediction":"a black plague","exact":0,"f1":0.0},{"task":"qa","id":"","source_text":"The Black Death was a disease that spread across Europe between 1347 and 1351, killing between 30 and 60 percent of the population. It was caused by a type of bacteria carried by fleas that lived on rats traveling on trade ships. The huge loss of people caused labor shortages, which meant that surviving workers could ask for higher pay and better conditions — helping to slowly end the system of serfdom in Western Europe.","question":"What social change did the population loss described in the text help bring about?","answer":"the end of serfdom in Western Europe","prediction":"serfdom","exact":0,"f1":0.25},{"task":"qa","id":"","source_text":"The Black Death was a disease that spread across Europe between 1347 and 1351, killing between 30 and 60 percent of the population. It was caused by a type of bacteria carried by fleas that lived on rats traveling on trade ships. The huge loss of people caused labor shortages, which meant that surviving workers could ask for higher pay and better conditions — helping to slowly end the system of serfdom in Western Europe.","question":"Why could workers ask for better pay after the event described in the text?","answer":"labor shortages caused by the huge loss of people","prediction":"lack of working conditions","exact":0,"f1":0.154},{"task":"qa","id":"","source_text":"The Bretton Woods system, created in 1944, linked the exchange rates of major currencies to the US dollar, which was itself tied to gold at $35 per ounce. This gave the United States a central role in the world financial system. The system ended in 1971 when the US president stopped allowing dollars to be exchanged for gold, and countries moved to freely floating exchange rates.","question":"What was the US dollar tied to under the system described in the text?","answer":"gold at $35 per ounce","prediction":"gold","exact":0,"f1":0.333},{"task":"qa","id":"","source_text":"The Bretton Woods system, created in 1944, linked the exchange rates of major currencies to the US dollar, which was itself tied to gold at $35 per ounce. This gave the United States a central role in the world financial system. The system ended in 1971 when the US president stopped allowing dollars to be exchanged for gold, and countries moved to freely floating exchange rates.","question":"What did the decision described in the text lead to?","answer":"countries moving to freely floating exchange rates","prediction":"the world financial system","exact":0,"f1":0.0},{"task":"qa","id":"","source_text":"The Bretton Woods system, created in 1944, linked the exchange rates of major currencies to the US dollar, which was itself tied to gold at $35 per ounce. This gave the United States a central role in the world financial system. The system ended in 1971 when the US president stopped allowing dollars to be exchanged for gold, and countries moved to freely floating exchange rates.","question":"Why did this system give the United States such a central role in world finance?","answer":"because major currencies were linked to the US dollar","prediction":"the Bretton Woods system","exact":0,"f1":0.154},{"task":"qa","id":"","source_text":"Photosynthesis in plants happens in two main steps. In the first step, which takes place in a part of the cell called the thylakoid, sunlight is turned into chemical energy. Oxygen is released as a byproduct. In the second step, called the Calvin cycle, that chemical energy is used to turn carbon dioxide from the air into sugar that the plant can use.","question":"What is released as a byproduct in the first step of photosynthesis?","answer":"oxygen","prediction":"oxygen","exact":1,"f1":1.0},{"task":"qa","id":"","source_text":"Photosynthesis in plants happens in two main steps. In the first step, which takes place in a part of the cell called the thylakoid, sunlight is turned into chemical energy. Oxygen is released as a byproduct. In the second step, called the Calvin cycle, that chemical energy is used to turn carbon dioxide from the air into sugar that the plant can use.","question":"Where in the cell does the first step described in the text take place?","answer":"in the thylakoid","prediction":"in the thylakoid","exact":1,"f1":1.0},{"task":"qa","id":"","source_text":"Photosynthesis in plants happens in two main steps. In the first step, which takes place in a part of the cell called the thylakoid, sunlight is turned into chemical energy. Oxygen is released as a byproduct. In the second step, called the Calvin cycle, that chemical energy is used to turn carbon dioxide from the air into sugar that the plant can use.","question":"What is the purpose of the second step described in the text?","answer":"to turn carbon dioxide from the air into sugar","prediction":"turn chemical energy into light","exact":0,"f1":0.286},{"task":"qa","id":"","source_text":"Mitochondria are small structures inside cells that produce most of the energy a cell needs. They do this by breaking down nutrients and using the energy released to make a molecule called ATP. Almost every process in the body that needs energy depends on ATP made by mitochondria, which is why they are often called the powerhouse of the cell.","question":"What molecule do mitochondria produce to supply energy to the cell?","answer":"ATP","prediction":"ATP","exact":1,"f1":1.0},{"task":"qa","id":"","source_text":"Mitochondria are small structures inside cells that produce most of the energy a cell needs. They do this by breaking down nutrients and using the energy released to make a molecule called ATP. Almost every process in the body that needs energy depends on ATP made by mitochondria, which is why they are often called the powerhouse of the cell.","question":"Why are the structures described in the text called the powerhouse of the cell?","answer":"because almost every process that needs energy depends on the ATP they produce","prediction":"because of the fact that ATP is needed for the power","exact":0,"f1":0.333},{"task":"qa","id":"","source_text":"The Great Wall of China was built over many centuries by different ruling dynasties. Its main purpose was to protect Chinese territory from raids and invasions from the north. Large parts were built using local materials such as stone, brick, and packed earth. The wall stretches for thousands of kilometers across northern China and includes watchtowers where soldiers could spot and signal approaching threats.","question":"What was the main reason the structure described in the text was built?","answer":"to protect Chinese territory from raids and invasions from the north","prediction":"protecting China from Chinese raids and invasions","exact":0,"f1":0.556},{"task":"qa","id":"","source_text":"The Great Wall of China was built over many centuries by different ruling dynasties. Its main purpose was to protect Chinese territory from raids and invasions from the north. Large parts were built using local materials such as stone, brick, and packed earth. The wall stretches for thousands of kilometers across northern China and includes watchtowers where soldiers could spot and signal approaching threats.","question":"What were the watchtowers used for according to the text?","answer":"to spot and signal approaching threats","prediction":"to signal and spot approaching threats.","exact":0,"f1":0.833},{"task":"qa","id":"","source_text":"The Great Wall of China was built over many centuries by different ruling dynasties. Its main purpose was to protect Chinese territory from raids and invasions from the north. Large parts were built using local materials such as stone, brick, and packed earth. The wall stretches for thousands of kilometers across northern China and includes watchtowers where soldiers could spot and signal approaching threats.","question":"What materials were used to build the structure described in the text?","answer":"stone, brick, and packed earth","prediction":"local stone, brick, and packed earth","exact":0,"f1":0.909},{"task":"qa","id":"","source_text":"The human immune system has two main layers of defense. The first layer responds quickly to any foreign substance that enters the body and does not target specific threats. The second layer is slower but more precise — it recognizes specific invaders and creates memory cells that help the body respond faster if the same threat appears again in the future.","question":"What is the advantage of the second layer of defense described in the text?","answer":"it recognizes specific invaders and creates memory cells for faster future response","prediction":"can remember specific cells that create the memory","exact":0,"f1":0.3},{"task":"qa","id":"","source_text":"The human immune system has two main layers of defense. The first layer responds quickly to any foreign substance that enters the body and does not target specific threats. The second layer is slower but more precise — it recognizes specific invaders and creates memory cells that help the body respond faster if the same threat appears again in the future.","question":"How does the first layer of defense described in the text differ from the second?","answer":"it responds quickly to any foreign substance and does not target specific threats","prediction":"slower","exact":0,"f1":0.0},{"task":"qa","id":"","source_text":"The human immune system has two main layers of defense. The first layer responds quickly to any foreign substance that enters the body and does not target specific threats. The second layer is slower but more precise — it recognizes specific invaders and creates memory cells that help the body respond faster if the same threat appears again in the future.","question":"What do the memory cells mentioned in the text help the body do?","answer":"respond faster if the same threat appears again in the future","prediction":"remember the correct time so that the future appears again in the same threat","exact":0,"f1":0.56},{"task":"qa","id":"","source_text":"Tectonic plates are large sections of the Earth's outer layer that move very slowly over time. When two plates push against each other, pressure builds up and is sometimes released suddenly as an earthquake. Where one plate slides under another, volcanoes can form. The movement of these plates over millions of years has shaped the continents and ocean floors we see today.","question":"What happens when pressure between two plates is suddenly released?","answer":"an earthquake occurs","prediction":"the earth is suddenly released","exact":0,"f1":0.0},{"task":"qa","id":"","source_text":"Tectonic plates are large sections of the Earth's outer layer that move very slowly over time. When two plates push against each other, pressure builds up and is sometimes released suddenly as an earthquake. Where one plate slides under another, volcanoes can form. The movement of these plates over millions of years has shaped the continents and ocean floors we see today.","question":"How do volcanoes form according to the text?","answer":"where one plate slides under another","prediction":"as a result, one plate is pushed up and suddenly becomes released under pressure","exact":0,"f1":0.3},{"task":"qa","id":"","source_text":"Tectonic plates are large sections of the Earth's outer layer that move very slowly over time. When two plates push against each other, pressure builds up and is sometimes released suddenly as an earthquake. Where one plate slides under another, volcanoes can form. The movement of these plates over millions of years has shaped the continents and ocean floors we see today.","question":"What long-term effect has the movement described in the text had on the planet?","answer":"it has shaped the continents and ocean floors we see today","prediction":"over millions of years, the movement has shaped the continents and ocean floors we see today.","exact":0,"f1":0.667},{"task":"qa","id":"","source_text":"During World War Two, the Allied forces landed on the beaches of Normandy in northern France on June 6, 1944. This operation involved over 150,000 soldiers crossing the English Channel in one day. It was one of the largest sea-to-land military operations in history. The success of the landing allowed Allied forces to establish a base in Western Europe and begin pushing back against German-controlled territory.","question":"How many soldiers took part in the operation described in the text?","answer":"over 150,000 soldiers","prediction":"150,000","exact":0,"f1":0.5},{"task":"qa","id":"","source_text":"During World War Two, the Allied forces landed on the beaches of Normandy in northern France on June 6, 1944. This operation involved over 150,000 soldiers crossing the English Channel in one day. It was one of the largest sea-to-land military operations in history. The success of the landing allowed Allied forces to establish a base in Western Europe and begin pushing back against German-controlled territory.","question":"What did the success of the operation described in the text allow the Allied forces to do?","answer":"establish a base in Western Europe and begin pushing back against German-controlled territory","prediction":"establish a base in Western Germany and begin pushing back against German-controlled territory.","exact":0,"f1":0.846},{"task":"qa","id":"","source_text":"During World War Two, the Allied forces landed on the beaches of Normandy in northern France on June 6, 1944. This operation involved over 150,000 soldiers crossing the English Channel in one day. It was one of the largest sea-to-land military operations in history. The success of the landing allowed Allied forces to establish a base in Western Europe and begin pushing back against German-controlled territory.","question":"Where did the military operation described in the text take place?","answer":"on the beaches of Normandy in northern France","prediction":"sea","exact":0,"f1":0.0},{"task":"qa","id":"","source_text":"The water cycle describes how water moves continuously between the Earth's surface and the atmosphere. Water from oceans, lakes, and rivers evaporates into the air when heated by the sun. It then cools, forms clouds, and falls back to the surface as rain or snow. This process distributes fresh water across the planet and plays a key role in regulating temperature and weather patterns.","question":"What causes water to evaporate into the air according to the text?","answer":"heat from the sun","prediction":"heat","exact":0,"f1":0.4},{"task":"qa","id":"","source_text":"The water cycle describes how water moves continuously between the Earth's surface and the atmosphere. Water from oceans, lakes, and rivers evaporates into the air when heated by the sun. It then cools, forms clouds, and falls back to the surface as rain or snow. This process distributes fresh water across the planet and plays a key role in regulating temperature and weather patterns.","question":"What role does the process described in the text play for the planet?","answer":"it distributes fresh water and regulates temperature and weather patterns","prediction":"regulates climate and weather patterns","exact":0,"f1":0.533},{"task":"qa","id":"","source_text":"The printing press was invented by Johannes Gutenberg in Europe around 1440. Before this invention, books had to be copied by hand, which made them rare and expensive. The press allowed texts to be produced quickly and at low cost. This helped spread new ideas across Europe much faster than before, and is often seen as one of the reasons why the Renaissance and later the Scientific Revolution were able to grow so quickly.","question":"Why were books rare and expensive before the invention described in the text?","answer":"they had to be copied by hand","prediction":"copying was expensive","exact":0,"f1":0.0},{"task":"qa","id":"","source_text":"The printing press was invented by Johannes Gutenberg in Europe around 1440. Before this invention, books had to be copied by hand, which made them rare and expensive. The press allowed texts to be produced quickly and at low cost. This helped spread new ideas across Europe much faster than before, and is often seen as one of the reasons why the Renaissance and later the Scientific Revolution were able to grow so quickly.","question":"What effect did the invention described in the text have on the spread of ideas?","answer":"it helped spread new ideas across Europe much faster than before","prediction":"it helped spread new ideas across Europe much faster than before","exact":1,"f1":1.0},{"task":"qa","id":"","source_text":"The printing press was invented by Johannes Gutenberg in Europe around 1440. Before this invention, books had to be copied by hand, which made them rare and expensive. The press allowed texts to be produced quickly and at low cost. This helped spread new ideas across Europe much faster than before, and is often seen as one of the reasons why the Renaissance and later the Scientific Revolution were able to grow so quickly.","question":"What two historical movements does the text link to this invention?","answer":"the Renaissance and the Scientific Revolution","prediction":"the Renaissance and the Scientific Revolution","exact":1,"f1":0.833},{"task":"qa","id":"","source_text":"Coral reefs are underwater structures built by tiny sea animals called corals. The corals produce a hard material that slowly builds up into large reef structures over thousands of years. Reefs are home to a huge variety of sea life and protect coastlines from waves and storms. When the ocean temperature rises too much, corals lose the algae that give them color and food, a process called bleaching, which can kill the reef.","question":"What happens to corals when ocean temperature rises too much?","answer":"they lose the algae that give them color and food, a process called bleaching","prediction":"the corals lose too much oxygen","exact":0,"f1":0.2},{"task":"qa","id":"","source_text":"Coral reefs are underwater structures built by tiny sea animals called corals. The corals produce a hard material that slowly builds up into large reef structures over thousands of years. Reefs are home to a huge variety of sea life and protect coastlines from waves and storms. When the ocean temperature rises too much, corals lose the algae that give them color and food, a process called bleaching, which can kill the reef.","question":"What two roles do the structures described in the text play for the environment?","answer":"they support a huge variety of sea life and protect coastlines from waves and storms","prediction":"coastal homes and coastlines","exact":0,"f1":0.211},{"task":"qa","id":"","source_text":"Coral reefs are underwater structures built by tiny sea animals called corals. The corals produce a hard material that slowly builds up into large reef structures over thousands of years. Reefs are home to a huge variety of sea life and protect coastlines from waves and storms. When the ocean temperature rises too much, corals lose the algae that give them color and food, a process called bleaching, which can kill the reef.","question":"How long does it take for the structures described in the text to form?","answer":"thousands of years","prediction":"over thousands of years","exact":0,"f1":0.857},{"task":"qa","id":"","source_text":"The Roman Empire reached its largest size under the emperor Trajan around 117 AD, covering parts of Europe, North Africa, and the Middle East. It was held together by a network of roads, a common legal system, and a large professional army. As the empire grew, it became harder to defend its long borders, and over time political instability and outside pressure led to the gradual loss of territory in the west.","question":"What three things held the empire described in the text together?","answer":"a network of roads, a common legal system, and a large professional army","prediction":"a network of roads, a common legal system","exact":0,"f1":0.571},{"task":"qa","id":"","source_text":"The Roman Empire reached its largest size under the emperor Trajan around 117 AD, covering parts of Europe, North Africa, and the Middle East. It was held together by a network of roads, a common legal system, and a large professional army. As the empire grew, it became harder to defend its long borders, and over time political instability and outside pressure led to the gradual loss of territory in the west.","question":"Why did the empire described in the text start losing territory in the west?","answer":"political instability and outside pressure made it harder to defend its long borders","prediction":"the gradual loss of territory in the west","exact":0,"f1":0.0},{"task":"qa","id":"","source_text":"The Roman Empire reached its largest size under the emperor Trajan around 117 AD, covering parts of Europe, North Africa, and the Middle East. It was held together by a network of roads, a common legal system, and a large professional army. As the empire grew, it became harder to defend its long borders, and over time political instability and outside pressure led to the gradual loss of territory in the west.","question":"When did the empire described in the text reach its largest size?","answer":"around 117 AD","prediction":"107 AD","exact":0,"f1":0.4},{"task":"qa","id":"","source_text":"The ozone layer is a region of the Earth's atmosphere that contains high concentrations of ozone gas. It absorbs most of the sun's harmful ultraviolet radiation before it reaches the surface. In the 1970s and 1980s, scientists discovered that certain chemicals used in refrigerators and spray cans were destroying the ozone layer. International agreements to stop using these chemicals have led to a slow recovery of the ozone layer since the 1990s.","question":"What is the main function of the layer described in the text?","answer":"to absorb the sun's harmful ultraviolet radiation before it reaches the surface","prediction":"absorbs most of the sun's harmful ultraviolet radiation before it reaches the surface","exact":0,"f1":0.72},{"task":"qa","id":"","source_text":"The ozone layer is a region of the Earth's atmosphere that contains high concentrations of ozone gas. It absorbs most of the sun's harmful ultraviolet radiation before it reaches the surface. In the 1970s and 1980s, scientists discovered that certain chemicals used in refrigerators and spray cans were destroying the ozone layer. International agreements to stop using these chemicals have led to a slow recovery of the ozone layer since the 1990s.","question":"What caused the damage to the layer described in the text?","answer":"certain chemicals used in refrigerators and spray cans","prediction":"the use of certain chemicals in refrigerators and spray cans","exact":0,"f1":0.778},{"task":"qa","id":"","source_text":"The ozone layer is a region of the Earth's atmosphere that contains high concentrations of ozone gas. It absorbs most of the sun's harmful ultraviolet radiation before it reaches the surface. In the 1970s and 1980s, scientists discovered that certain chemicals used in refrigerators and spray cans were destroying the ozone layer. International agreements to stop using these chemicals have led to a slow recovery of the ozone layer since the 1990s.","question":"What has happened to the layer described in the text since the international agreements were made?","answer":"it has been slowly recovering since the 1990s","prediction":"since the 1990s, the ozone layer has been destroyed","exact":0,"f1":0.471},{"task":"qa","id":"","source_text":"Vaccines work by introducing a harmless version of a virus or bacteria — or just a small part of it — into the body. The immune system responds by learning to recognize the threat and building defenses against it. If the person later comes into contact with the real disease, the immune system can respond quickly and prevent serious illness. This principle has been used to reduce or eliminate many diseases that were once common worldwide.","question":"How does the immune system respond to the substance introduced in the process described in the text?","answer":"by learning to recognize the threat and building defenses against it","prediction":"reacts to the threat and learning to recognize building blocks","exact":0,"f1":0.667},{"task":"qa","id":"","source_text":"Vaccines work by introducing a harmless version of a virus or bacteria — or just a small part of it — into the body. The immune system responds by learning to recognize the threat and building defenses against it. If the person later comes into contact with the real disease, the immune system can respond quickly and prevent serious illness. This principle has been used to reduce or eliminate many diseases that were once common worldwide.","question":"What happens when a vaccinated person comes into contact with the actual disease?","answer":"the immune system can respond quickly and prevent serious illness","prediction":"the real person can respond quickly and prevent serious illness","exact":0,"f1":0.8},{"task":"qa","id":"","source_text":"Vaccines work by introducing a harmless version of a virus or bacteria — or just a small part of it — into the body. The immune system responds by learning to recognize the threat and building defenses against it. If the person later comes into contact with the real disease, the immune system can respond quickly and prevent serious illness. This principle has been used to reduce or eliminate many diseases that were once common worldwide.","question":"What broader effect has the method described in the text had on disease worldwide?","answer":"it has helped reduce or eliminate many diseases that were once common worldwide","prediction":"many common diseases","exact":0,"f1":0.375},{"task":"qa","id":"","source_text":"Inflation means that prices across an economy are rising over time, so the same amount of money can buy less than it could before. Central banks try to control inflation by raising interest rates, which makes borrowing more expensive and slows down spending and investment. If inflation rises too fast, it can reduce people's savings and create economic uncertainty. If it falls too low, it can signal weak demand and slow economic growth.","question":"How do central banks respond to rising inflation according to the text?","answer":"by raising interest rates","prediction":"raise interest rates","exact":0,"f1":0.571},{"task":"qa","id":"","source_text":"Inflation means that prices across an economy are rising over time, so the same amount of money can buy less than it could before. Central banks try to control inflation by raising interest rates, which makes borrowing more expensive and slows down spending and investment. If inflation rises too fast, it can reduce people's savings and create economic uncertainty. If it falls too low, it can signal weak demand and slow economic growth.","question":"What are the two negative outcomes of the two extremes described in the text?","answer":"rising too fast reduces savings and creates uncertainty; falling too low signals weak demand and slows growth","prediction":"rising inflation and slowing down spending","exact":0,"f1":0.174},{"task":"qa","id":"","source_text":"Inflation means that prices across an economy are rising over time, so the same amount of money can buy less than it could before. Central banks try to control inflation by raising interest rates, which makes borrowing more expensive and slows down spending and investment. If inflation rises too fast, it can reduce people's savings and create economic uncertainty. If it falls too low, it can signal weak demand and slow economic growth.","question":"Why does raising interest rates help slow down the process described in the text?","answer":"it makes borrowing more expensive and slows down spending and investment","prediction":"reduces inflation","exact":0,"f1":0.0},{"task":"qa","id":"","source_text":"Sharks have existed on Earth for over 400 million years, making them older than trees. They play an important role at the top of the ocean food chain by controlling the populations of the animals they hunt. Without sharks, prey populations could grow too large and damage the ecosystems they live in. Despite their reputation, most shark species do not pose a threat to humans, and sharks are more at risk from humans than the other way around.","question":"What role do the animals described in the text play in ocean ecosystems?","answer":"they control the populations of the animals they hunt at the top of the food chain","prediction":"important","exact":0,"f1":0.0}];const MAX_CUTOFF=256;const PAGE_SIZE=20;let gCutoff=64;</script>
+
+<body>
+<div class="hdr">
+  <div class="hdr-top">
+    <h1>Просмотр предсказаний модели</h1>
+    <div class="controls">
+      <div class="tabs" id="tabs">
+        <button class="tab active" data-f="all">Все</button>
+        <button class="tab" data-f="narrative">Narrative</button>
+        <button class="tab" data-f="qa">QA</button>
+      </div>
+      <div class="slider-wrap" id="slider-wrap">
+        <label>Cutoff:</label>
+        <input type="range" id="slider" min="8" step="8">
+        <strong id="cutoff-lbl"></strong> <span style="color:#a0aec0;font-size:12px">токенов</span>
+      </div>
+      <div class="search-wrap">
+        <input type="text" id="search" placeholder="🔍 Поиск...">
+      </div>
+    </div>
+  </div>
+  <div class="metrics-bar" id="metrics-bar"></div>
+</div>
+<div class="stats-bar" id="stats-bar"></div>
+<div class="content">
+  <div id="cards"></div>
+  <div class="pagination" id="pg"></div>
+</div>
+
+<script>
+// ── helpers ────────────────────────────────────────────────────────────────
+function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+
+function highlightAnswer(src, ans){
+  if(!ans) return esc(src);
+  const lo = src.toLowerCase(), al = ans.toLowerCase();
+  const i = lo.indexOf(al);
+  if(i===-1) return esc(src);
+  return esc(src.slice(0,i))+'<mark class="ans-hl">'+esc(src.slice(i,i+ans.length))+'</mark>'+esc(src.slice(i+ans.length));
+}
+
+// ── state ──────────────────────────────────────────────────────────────────
+let gFilter = "all", gPage = 0, gQuery = "";
+let gFiltered = DATA;
+
+function applyFilter(){
+  const q = gQuery.toLowerCase();
+  gFiltered = DATA.filter(d => {
+    if(gFilter !== "all" && d.task !== gFilter) return false;
+    if(!q) return true;
+    const haystack = d.task==="narrative"
+      ? (d.src_preview||"")
+      : (d.source_text||"")+" "+(d.question||"")+" "+(d.answer||"")+" "+(d.prediction||"");
+    return haystack.toLowerCase().includes(q);
+  });
+  gPage = 0;
+  render();
+}
+
+// ── Metrics ────────────────────────────────────────────────────────────────
+function computeMetrics(){
+  const narItems = gFiltered.filter(d=>d.task==="narrative");
+  const qaItems  = gFiltered.filter(d=>d.task==="qa");
+  let html = "";
+
+  if(narItems.length){
+    let totMatched=0, totCmp=0;
+    for(const d of narItems){
+      const n = Math.min(gCutoff, d.matches.length);
+      totMatched += d.matches.slice(0,n).filter(Boolean).length;
+      totCmp += n;
+    }
+    const avg = totCmp ? totMatched/totCmp*100 : 0;
+    const col = avg>=70?"#68d391":avg>=40?"#f6e05e":"#fc8181";
+    html += `<div class="mg">
+      <span class="mg-label" style="color:var(--nar-light)">Narrative</span>
+      <div class="mi">
+        <span class="mi-label">Avg Match @ ${gCutoff} tok</span>
+        <div class="mi-row">
+          <div class="mbar"><div class="mbar-fill" style="width:${avg.toFixed(0)}%;background:${col}"></div></div>
+          <span class="mi-val" style="color:${col}">${avg.toFixed(1)}%</span>
+        </div>
+      </div>
+      <span style="font-size:11px;color:#718096">${narItems.length} прим.</span>
+    </div>`;
+  }
+
+  if(narItems.length && qaItems.length) html += '<div class="msep"></div>';
+
+  if(qaItems.length){
+    const valid = qaItems.filter(d=>d.exact!==-1);
+    const em = valid.length ? valid.filter(d=>d.exact).length/valid.length*100 : -1;
+    const f1 = valid.length ? valid.reduce((s,d)=>s+d.f1,0)/valid.length*100 : -1;
+    const emCol = em>=50?"#68d391":em>=25?"#f6e05e":"#fc8181";
+    const f1Col = f1>=60?"#68d391":f1>=30?"#f6e05e":"#fc8181";
+    const emStr = em>=0?em.toFixed(1)+"%" :"—";
+    const f1Str = f1>=0?f1.toFixed(1)+"%" :"—";
+    const emW   = em>=0?em.toFixed(0):0;
+    const f1W   = f1>=0?f1.toFixed(0):0;
+    html += `<div class="mg">
+      <span class="mg-label" style="color:var(--qa-light)">QA</span>
+      <div class="mi">
+        <span class="mi-label">Exact Match</span>
+        <div class="mi-row">
+          <div class="mbar"><div class="mbar-fill" style="width:${emW}%;background:${emCol}"></div></div>
+          <span class="mi-val" style="color:${emCol}">${emStr}</span>
+        </div>
+      </div>
+      <div class="mi">
+        <span class="mi-label">F1 Score</span>
+        <div class="mi-row">
+          <div class="mbar"><div class="mbar-fill" style="width:${f1W}%;background:${f1Col}"></div></div>
+          <span class="mi-val" style="color:${f1Col}">${f1Str}</span>
+        </div>
+      </div>
+      <span style="font-size:11px;color:#718096">${qaItems.length} прим.</span>
+    </div>`;
+  }
+
+  document.getElementById("metrics-bar").innerHTML = html||'<span style="color:#718096;font-size:12px">Нет данных</span>';
+}
+
+// ── render ─────────────────────────────────────────────────────────────────
+function render(){
+  const total  = gFiltered.length;
+  const pages  = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  if(gPage >= pages) gPage = pages - 1;
+  const start  = gPage * PAGE_SIZE;
+  const slice  = gFiltered.slice(start, start + PAGE_SIZE);
+
+  // metrics bar (cutoff-sensitive)
+  computeMetrics();
+
+  // stats bar
+  const narN = gFiltered.filter(d=>d.task==="narrative").length;
+  const qaN  = gFiltered.filter(d=>d.task==="qa").length;
+  document.getElementById("stats-bar").textContent =
+    `Показано: ${total} примеров  |  Narrative: ${narN}  |  QA: ${qaN}  |  Страница ${gPage+1} из ${pages}`;
+
+  // slider visibility
+  const hasNar = gFilter !== "qa";
+  document.getElementById("slider-wrap").style.display = hasNar ? "flex" : "none";
+
+  // cards
+  const html = slice.length ? slice.map(renderCard).join("") : '<div class="empty">Ничего не найдено</div>';
+  document.getElementById("cards").innerHTML = html;
+
+  // expand buttons
+  document.querySelectorAll(".expand-btn").forEach(btn=>{
+    btn.addEventListener("click", ()=>{
+      const prev = btn.previousElementSibling;
+      const expanded = prev.classList.toggle("expanded");
+      btn.textContent = expanded ? "свернуть ▲" : "развернуть ▼";
+    });
+  });
+
+  // pagination
+  renderPagination(pages);
+}
+
+function renderCard(d){
+  return d.task === "narrative" ? renderNarrative(d) : renderQA(d);
+}
+
+// ── Narrative ──────────────────────────────────────────────────────────────
+function renderNarrative(d){
+  const cutoff   = gCutoff;
+  const cmpLen   = Math.min(cutoff, d.matches.length);
+  const matched  = d.matches.slice(0, cmpLen).filter(Boolean).length;
+  const pct      = cmpLen ? (matched/cmpLen*100).toFixed(1) : "—";
+  const mbCls    = pct>=80?"mbadge-good":pct>=50?"mbadge-ok":"mbadge-bad";
+
+  // Build token spans for prediction
+  let tokHtml = "";
+  for(let i=0; i<d.pred_tokens.length; i++){
+    const t = esc(d.pred_tokens[i]);
+    if(i === cutoff){
+      tokHtml += '<span class="cutoff-marker" title="граница cutoff"></span>';
+    }
+    if(i >= cutoff){
+      tokHtml += `<span class="tok-b">${t}</span>`;
+    } else if(i < d.matches.length){
+      tokHtml += `<span class="${d.matches[i]?'tok-m':'tok-x'}">${t}</span>`;
+    } else {
+      tokHtml += `<span class="tok-x">${t}</span>`;
+    }
+  }
+  if(d.pred_total > MAX_CUTOFF){
+    tokHtml += `<span class="tok-b"> …(ещё ${d.pred_total-MAX_CUTOFF} токенов)</span>`;
+  }
+
+  return `
+<div class="card">
+  <div class="card-hdr">
+    <span class="badge badge-nar">Narrative</span>
+    <span class="card-id">${esc(d.id)}</span>
+    <div class="card-hdr-right">
+      <span class="mbadge ${mbCls}">${matched}/${cmpLen} совпало (${pct}%)</span>
+      <span class="len-pill">src ${d.src_total} tok</span>
+      <span class="len-pill">pred ${d.pred_total} tok</span>
+    </div>
+  </div>
+  <div class="section">
+    <div class="sec-label">Исходный текст (цель)</div>
+    <div class="src-preview">${esc(d.src_preview)}${d.src_preview.length>=800?"…":""}</div>
+    <span class="expand-btn">развернуть ▼</span>
+  </div>
+  <div class="section">
+    <div class="sec-label">Предсказание модели</div>
+    <div class="tok-text">${tokHtml}</div>
+    <div class="legend">
+      <span class="legend-item"><span class="legend-swatch" style="background:var(--match-bg)"></span>совпадает</span>
+      <span class="legend-item"><span class="legend-swatch" style="background:var(--miss-bg)"></span>не совпадает</span>
+      <span class="legend-item"><span class="legend-swatch" style="background:#e2e8f0"></span>за пределами cutoff</span>
+    </div>
+  </div>
+</div>`;
+}
+
+// ── QA ─────────────────────────────────────────────────────────────────────
+function renderQA(d){
+  const hasGT = d.exact !== -1;
+  let scoreBadge = "";
+  let ansCls = "";
+  if(hasGT){
+    const f1pct = (d.f1*100).toFixed(0);
+    if(d.exact){
+      scoreBadge = `<span class="qbadge qbadge-exact">Точное совпадение</span>`;
+      ansCls = "exact-match";
+    } else if(d.f1 >= 0.7){
+      scoreBadge = `<span class="qbadge qbadge-good">F1 = ${f1pct}%</span>`;
+      ansCls = "good-match";
+    } else if(d.f1 >= 0.3){
+      scoreBadge = `<span class="qbadge qbadge-ok">F1 = ${f1pct}%</span>`;
+      ansCls = "bad-match";
+    } else {
+      scoreBadge = `<span class="qbadge qbadge-bad">F1 = ${f1pct}%</span>`;
+      ansCls = "bad-match";
+    }
+  }
+
+  const ctxHtml = highlightAnswer(d.source_text, d.answer);
+
+  const ansRow = hasGT ? `
+  <div class="section">
+    <div class="qa-grid">
+      <div>
+        <div class="qa-box-label">Правильный ответ</div>
+        <div class="qa-box">${esc(d.answer||"—")}</div>
+      </div>
+      <div>
+        <div class="qa-box-label">Предсказание модели</div>
+        <div class="qa-box ${ansCls}">${esc(d.prediction||"—")}</div>
+      </div>
+    </div>
+  </div>` : `
+  <div class="section">
+    <div class="sec-label">Предсказание модели</div>
+    <div class="qa-box">${esc(d.prediction||"—")}</div>
+  </div>`;
+
+  return `
+<div class="card">
+  <div class="card-hdr">
+    <span class="badge badge-qa">QA</span>
+    <span class="card-id">${esc(d.id)}</span>
+    <div class="card-hdr-right">${scoreBadge}</div>
+  </div>
+  <div class="section">
+    <div class="sec-label">Контекст <span class="len-pill">source_text</span></div>
+    <div class="src-preview">${ctxHtml}</div>
+    <span class="expand-btn">развернуть ▼</span>
+  </div>
+  <div class="section">
+    <div class="sec-label">Вопрос</div>
+    <div class="question-box">${esc(d.question)}</div>
+  </div>
+  ${ansRow}
+</div>`;
+}
+
+// ── Pagination ─────────────────────────────────────────────────────────────
+function renderPagination(pages){
+  let html = "";
+  html += `<button class="pg-btn" id="pg-prev" ${gPage===0?"disabled":""}>← Назад</button>`;
+  html += `<span class="pg-info">Страница ${gPage+1} / ${pages}</span>`;
+  html += `<button class="pg-btn" id="pg-next" ${gPage>=pages-1?"disabled":""}>Вперёд →</button>`;
+  document.getElementById("pg").innerHTML = html;
+  document.getElementById("pg-prev")?.addEventListener("click",()=>{ gPage--; render(); window.scrollTo(0,0); });
+  document.getElementById("pg-next")?.addEventListener("click",()=>{ gPage++; render(); window.scrollTo(0,0); });
+}
+
+// ── Events ─────────────────────────────────────────────────────────────────
+const slider = document.getElementById("slider");
+const lbl    = document.getElementById("cutoff-lbl");
+slider.max   = MAX_CUTOFF;
+slider.value = gCutoff;
+lbl.textContent = gCutoff;
+
+slider.addEventListener("input", ()=>{
+  gCutoff = +slider.value;
+  lbl.textContent = gCutoff;
+  render();
+});
+
+document.querySelectorAll(".tab").forEach(tab=>{
+  tab.addEventListener("click",()=>{
+    document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
+    tab.classList.add("active");
+    gFilter = tab.dataset.f;
+    applyFilter();
+  });
+});
+
+let searchTimer;
+document.getElementById("search").addEventListener("input", e=>{
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(()=>{ gQuery = e.target.value; applyFilter(); }, 300);
+});
+
+// ── Init ───────────────────────────────────────────────────────────────────
+applyFilter();
+</script>
+</body>
+</html>

@@ -209,23 +209,28 @@ def main(config_path: str, train_ds, val_ds):
 
 
 if __name__ == "__main__":
-    # Expected schema: id, split, task, source_text, question, answer
-    # See src/data/schema.py
-    # config_path = "configs/base_config.yaml"
-    config_path = "configs/qwen_mlp_config.yaml"
-    cfg = load_config(config_path)
+    import argparse
 
-    dataset  = load_from_disk("data/unified_dataset")
-    seed     = cfg["experiment"]["seed"]
-    n_train  = cfg["data"].get("n_samples_train") or None   # None = use all remaining
-    n_val    = cfg["data"].get("n_samples_val", 1000)
+    parser = argparse.ArgumentParser(description="Train mapper-LLM pipeline")
+    parser.add_argument("--config", default="configs/qwen_mlp_config.yaml",
+                        help="Path to YAML training config (default: configs/qwen_mlp_config.yaml)")
+    parser.add_argument("--data",   default="data/unified_dataset",
+                        help="Path to HuggingFace dataset directory (load_from_disk)")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+
+    dataset = load_from_disk(args.data)
+    seed    = cfg["experiment"]["seed"]
+    n_train = cfg["data"].get("n_samples_train") or None
+    n_val   = cfg["data"].get("n_samples_val", 1000)
 
     # Carve out val first (no overlap with train), then take n_samples_train from rest.
-    shuffled     = dataset["train"].shuffle(seed=seed)
-    n_val_actual = min(n_val, len(shuffled))
-    val_ds       = shuffled.select(range(n_val_actual))
-    remaining    = shuffled.select(range(n_val_actual, len(shuffled)))
+    shuffled       = dataset["train"].shuffle(seed=seed)
+    n_val_actual   = min(n_val, len(shuffled))
+    val_ds         = shuffled.select(range(n_val_actual))
+    remaining      = shuffled.select(range(n_val_actual, len(shuffled)))
     n_train_actual = min(n_train or len(remaining), len(remaining))
-    train_ds     = remaining.select(range(n_train_actual))
+    train_ds       = remaining.select(range(n_train_actual))
 
-    main(config_path, train_ds, val_ds)
+    main(args.config, train_ds, val_ds)

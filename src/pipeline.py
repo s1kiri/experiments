@@ -10,6 +10,7 @@ from typing import Optional
 
 import torch
 import yaml
+from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from src.models.embedder import HFEmbedder
@@ -134,7 +135,10 @@ def load_pipeline(
         llm_tokenizer=llm_tok,
         soft_prompt_tokens=soft_prompt_tokens,
     )
-    module = module.to(device).eval()
+    module = module.to(device)
+    if device in ("cpu", "mps"):
+        module = module.float()  # bfloat16 checkpoint → float32 for CPU/MPS (bfloat16 unsupported)
+    module = module.eval()
     return module, emb_tok, llm_tok
 
 
@@ -168,7 +172,9 @@ def predict(
     module = module.to(device).eval()
 
     all_preds: list[str] = []
-    for start in range(0, len(records), batch_size):
+    batches = range(0, len(records), batch_size)
+    for start in tqdm(batches, desc="Inference", unit="batch",
+                      total=len(batches) if hasattr(batches, "__len__") else None):
         chunk = records[start : start + batch_size]
         all_preds.extend(
             _predict_batch(module, emb_tok, llm_tok, chunk,

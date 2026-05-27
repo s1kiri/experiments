@@ -1,0 +1,26 @@
+# CPU-only image — for local testing on Mac or any machine without NVIDIA GPU.
+# Production training uses Dockerfile (pytorch/pytorch CUDA base).
+#
+# Uses pip (not Poetry) because Poetry re-resolves torch from PyPI and pulls
+# NVIDIA CUDA packages even when torch-cpu is already installed.
+
+FROM python:3.11-slim
+
+WORKDIR /workspace
+
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+
+# Step 1: torch CPU — must come first so pip finds torch already satisfied
+# when resolving pytorch-lightning's torch dependency.
+RUN pip install --no-cache-dir \
+    torch==2.8.0 torchvision==0.23.0 \
+    --index-url https://download.pytorch.org/whl/cpu
+
+# Step 2: everything else
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+ENTRYPOINT ["python", "train.py"]
+CMD ["--help"]
